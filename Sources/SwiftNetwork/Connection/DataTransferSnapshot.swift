@@ -33,12 +33,23 @@ public struct DataTransferSnapshot: Equatable {
     var sentTransportECNCapableMarkedPacketCount: UInt64 = 0
     var sentTransportECNCapableLostPacketCount: UInt64 = 0
 
-    var transportSmoothedRTT: NetworkDuration = .milliseconds(0)
-    var transportMinimumRTT: NetworkDuration = .milliseconds(0)
-    var transportCurrentRTT: NetworkDuration = .milliseconds(0)
-    var transportRTTVariance: NetworkDuration = .milliseconds(0)
+    /// The transport's smoothed round-trip time. QUIC reports its current path's estimate.
+    ///
+    /// Before a measurement, QUIC may report its initial estimate.
+    public internal(set) var transportSmoothedRTT: NetworkDuration = .milliseconds(0)
+    /// The minimum round-trip time for the current QUIC path.
+    ///
+    /// Before the first sample, QUIC reports an unmeasured sentinel of `UInt32.max` seconds.
+    public internal(set) var transportMinimumRTT: NetworkDuration = .milliseconds(0)
+    /// The current round-trip time. QUIC reports its latest ACK-delay-adjusted sample.
+    public internal(set) var transportCurrentRTT: NetworkDuration = .milliseconds(0)
+    /// The transport's round-trip time variance estimate for the current QUIC path.
+    public internal(set) var transportRTTVariance: NetworkDuration = .milliseconds(0)
 
-    var transportCongestionWindow: UInt64 = 0
+    /// The congestion window in bytes. QUIC reports its current path's window.
+    ///
+    /// QUIC leaves the RTT and congestion fields at zero when there is no current path.
+    public internal(set) var transportCongestionWindow: UInt64 = 0
     var transportSlowStartThreshold: UInt64 = 0
 
     var receivedApplicationByteCount: UInt64 = 0

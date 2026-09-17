@@ -51,6 +51,35 @@ internal import os
 
 @available(Network 0.1.0, *)
 final class SwiftNetworkQUICStatisticsTests: NetTestCase {
+    func testQUICTransportSnapshotMatchesCurrentPath() throws {
+        QUICTestHarness().runQUICTest(
+            blockSize: 10240,
+            blockCount: 4,
+            afterData: { harness in
+                let expectation = XCTestExpectation(description: "Validate QUIC transport snapshot")
+                harness.context.async {
+                    defer { expectation.fulfill() }
+                    guard let state = harness.state,
+                        let path = state.clientInstance.currentPath,
+                        case .dataTransferSnapshot(let snapshot) = state.clientHarness.getMetrics(
+                            requestedNetworkMetric: .dataTransferSnapshot
+                        )
+                    else {
+                        XCTFail("Established QUIC connection has no path or transfer snapshot")
+                        return
+                    }
+                    XCTAssertTrue(path.rtt.hasInitialMeasurement)
+                    XCTAssertEqual(snapshot.transportCurrentRTT, path.rtt.adjustedRTT)
+                    XCTAssertEqual(snapshot.transportMinimumRTT, path.rtt.minRTT)
+                    XCTAssertEqual(snapshot.transportSmoothedRTT, path.rtt.smoothedRTT)
+                    XCTAssertEqual(snapshot.transportRTTVariance, path.rtt.RTTVariance)
+                    XCTAssertGreaterThan(snapshot.transportCongestionWindow, 0)
+                }
+                self.wait(for: [expectation], timeout: 5.0)
+            }
+        )
+    }
+
     func testQUICStatisticsForOneStream() throws {
         QUICTestHarness().runQUICTest(
             blockSize: 10240,
