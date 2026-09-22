@@ -51,6 +51,66 @@ internal import os
 
 @available(Network 0.1.0, *)
 final class SwiftNetworkQUICStatisticsTests: NetTestCase {
+    func testQUICSnapshotStatisticsAreIsolated() throws {
+        QUICTestHarness().runQUICTest(
+            dataBlock: Array("isolation".utf8),
+            afterData: { harness in
+                let expectation = XCTestExpectation(description: "Validate snapshot isolation")
+                harness.context.async {
+                    defer { expectation.fulfill() }
+                    guard let state = harness.state else {
+                        XCTFail("Missing connection state")
+                        return
+                    }
+                    let first = state.clientInstance
+                    let second = state.serverInstance
+                    // Seed independent connection storage on its context. This tests
+                    // ownership and snapshot copies, not packet accounting.
+                    let firstSaved = first.stats[.ecnCapablePacketsSent]
+                    let secondSaved = second.stats[.ecnCapablePacketsSent]
+                    defer {
+                        first.stats[.ecnCapablePacketsSent] = firstSaved
+                        second.stats[.ecnCapablePacketsSent] = secondSaved
+                    }
+                    first.stats[.ecnCapablePacketsSent] = 17
+                    second.stats[.ecnCapablePacketsSent] = 31
+                    guard
+                        case .dataTransferSnapshot(let firstBefore) = first.getMetrics(
+                            flow: .allFlows,
+                            requestedNetworkMetric: .dataTransferSnapshot
+                        ),
+                        case .dataTransferSnapshot(let secondBefore) = second.getMetrics(
+                            flow: .allFlows,
+                            requestedNetworkMetric: .dataTransferSnapshot
+                        )
+                    else {
+                        XCTFail("Missing snapshots")
+                        return
+                    }
+                    first.stats[.ecnCapablePacketsSent] = 43
+                    guard
+                        case .dataTransferSnapshot(let firstAfter) = first.getMetrics(
+                            flow: .allFlows,
+                            requestedNetworkMetric: .dataTransferSnapshot
+                        ),
+                        case .dataTransferSnapshot(let secondAfter) = second.getMetrics(
+                            flow: .allFlows,
+                            requestedNetworkMetric: .dataTransferSnapshot
+                        )
+                    else {
+                        XCTFail("Missing updated snapshots")
+                        return
+                    }
+                    XCTAssertEqual(firstBefore.sentTransportECNCapablePacketCount, 17)
+                    XCTAssertEqual(firstAfter.sentTransportECNCapablePacketCount, 43)
+                    XCTAssertEqual(secondBefore.sentTransportECNCapablePacketCount, 31)
+                    XCTAssertEqual(secondAfter, secondBefore)
+                }
+                self.wait(for: [expectation], timeout: 5.0)
+            }
+        )
+    }
+
     func testQUICTransportSnapshotMatchesCurrentPath() throws {
         QUICTestHarness().runQUICTest(
             blockSize: 10240,
@@ -74,6 +134,34 @@ final class SwiftNetworkQUICStatisticsTests: NetTestCase {
                     XCTAssertEqual(snapshot.transportSmoothedRTT, path.rtt.smoothedRTT)
                     XCTAssertEqual(snapshot.transportRTTVariance, path.rtt.RTTVariance)
                     XCTAssertGreaterThan(snapshot.transportCongestionWindow, 0)
+                }
+                self.wait(for: [expectation], timeout: 5.0)
+            }
+        )
+    }
+
+    func testQUICEstablishmentReportMatchesConnection() throws {
+        QUICTestHarness().runQUICTest(
+            blockSize: 10240,
+            blockCount: 4,
+            afterData: { harness in
+                let expectation = XCTestExpectation(description: "Validate QUIC establishment timing")
+                harness.context.async {
+                    defer { expectation.fulfill() }
+                    guard let state = harness.state,
+                        case .protocolEstablishmentReports(let reports) = state.clientHarness.getMetrics(
+                            requestedNetworkMetric: .protocolEstablishmentReports
+                        ),
+                        let report = reports.first(where: { $0.protocolIdentifier == QUICConnectionProtocol.identifier }
+                        )
+                    else {
+                        XCTFail("Established connection has no QUIC establishment report")
+                        return
+                    }
+                    XCTAssertEqual(report.handshakeMilliseconds, state.clientInstance.handshakeDuration)
+                    XCTAssertEqual(report.handshakeRTTMilliseconds, state.clientInstance.handshakeRTT)
+                    XCTAssertGreaterThan(report.handshakeMilliseconds, .zero)
+                    XCTAssertGreaterThanOrEqual(report.handshakeRTTMilliseconds, .zero)
                 }
                 self.wait(for: [expectation], timeout: 5.0)
             }

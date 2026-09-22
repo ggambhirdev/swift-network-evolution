@@ -51,6 +51,101 @@ internal import os
 #if !NETWORK_PRIVATE
 @available(Network 0.1.0, *)
 final class SwiftNetworkQUICECNTests: NetTestCase {
+    private func assertECNSnapshotMatchesStatistics(
+        _ connection: QUICConnection,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard
+            case .dataTransferSnapshot(let snapshot) = connection.getMetrics(
+                flow: .allFlows,
+                requestedNetworkMetric: .dataTransferSnapshot
+            )
+        else {
+            XCTFail("Missing QUIC transfer snapshot", file: file, line: line)
+            return
+        }
+        XCTAssertEqual(
+            snapshot.sentTransportECNCapablePacketCount,
+            UInt64(connection.stats[.ecnCapablePacketsSent]),
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            snapshot.sentTransportECNCapableAckedPacketCount,
+            UInt64(connection.stats[.ecnCapablePacketsAcknowledged]),
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            snapshot.sentTransportECNCapableMarkedPacketCount,
+            UInt64(connection.stats[.ecnCapablePacketsMarked]),
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            snapshot.sentTransportECNCapableLostPacketCount,
+            UInt64(connection.stats[.ecnCapablePacketsLost]),
+            file: file,
+            line: line
+        )
+    }
+
+    func testECNSnapshotMapsDistinctStatistics() throws {
+        QUICTestHarness().runQUICTest(
+            dataBlock: Array("ECN snapshot".utf8),
+            afterData: { harness in
+                let expectation = XCTestExpectation(description: "Validate distinct ECN snapshot values")
+                harness.context.async {
+                    defer { expectation.fulfill() }
+                    guard let connection = harness.state?.clientInstance else {
+                        XCTFail("Missing QUIC connection")
+                        return
+                    }
+                    // This tests field mapping, not generation of CE or loss events.
+                    let keys: [QUICStatistic] = [
+                        .ecnCapablePacketsSent, .ecnCapablePacketsAcknowledged, .ecnCapablePacketsMarked,
+                        .ecnCapablePacketsLost,
+                    ]
+                    let saved = keys.map { connection.stats[$0] }
+                    defer {
+                        for (key, value) in zip(keys, saved) { connection.stats[key] = value }
+                    }
+                    for (key, value) in zip(keys, [41, 29, 7, 3]) { connection.stats[key] = value }
+                    self.assertECNSnapshotMatchesStatistics(connection)
+                }
+                self.wait(for: [expectation], timeout: 5.0)
+            }
+        )
+    }
+
+    func testECNSnapshotAfterPacketLoss() throws {
+        QUICTestHarness().runQUICTest(
+            blockSize: 10240,
+            blockCount: 4,
+            clientDrops: .init([0...0, 20...21]),
+            afterData: { harness in
+                let expectation = XCTestExpectation(description: "Validate ECN loss snapshot")
+                harness.context.async {
+                    defer { expectation.fulfill() }
+                    guard let connection = harness.state?.clientInstance,
+                        case .dataTransferSnapshot(let snapshot) = connection.getMetrics(
+                            flow: .allFlows,
+                            requestedNetworkMetric: .dataTransferSnapshot
+                        )
+                    else {
+                        XCTFail("Missing QUIC connection or snapshot")
+                        return
+                    }
+                    XCTAssertGreaterThan(connection.stats[.txLostPackets], 0)
+                    XCTAssertGreaterThan(snapshot.sentTransportECNCapableLostPacketCount, 0)
+                    self.assertECNSnapshotMatchesStatistics(connection)
+                }
+                self.wait(for: [expectation], timeout: 5.0)
+            }
+        )
+    }
+
     func testQUICTestECNMarkedPacketsSentAndACKed() throws {
         QUICTestHarness().runQUICTest(
             dataBlock: Array("Hello World!".utf8),
@@ -66,6 +161,12 @@ final class SwiftNetworkQUICECNTests: NetTestCase {
                         harness.state?.clientInstance.stats[.ecnCapablePacketsSent] ?? 0 > 0,
                         "Clients should have sent ECN marked packets"
                     )
+                    if let state = harness.state {
+                        self.assertECNSnapshotMatchesStatistics(state.clientInstance)
+                        self.assertECNSnapshotMatchesStatistics(state.serverInstance)
+                    } else {
+                        XCTFail("Missing QUIC connection state")
+                    }
                     expectation.fulfill()
                 }
                 self.wait(for: [expectation], timeout: 5.0)
@@ -96,6 +197,12 @@ final class SwiftNetworkQUICECNTests: NetTestCase {
                         harness.state?.clientInstance.stats[.ecnCapablePacketsSent] == 0,
                         "Clients should NOT have sent ECN marked packets"
                     )
+                    if let state = harness.state {
+                        self.assertECNSnapshotMatchesStatistics(state.clientInstance)
+                        self.assertECNSnapshotMatchesStatistics(state.serverInstance)
+                    } else {
+                        XCTFail("Missing QUIC connection state")
+                    }
                     expectation.fulfill()
                 }
                 self.wait(for: [expectation], timeout: 5.0)

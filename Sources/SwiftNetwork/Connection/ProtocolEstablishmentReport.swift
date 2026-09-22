@@ -46,9 +46,12 @@ public enum ServerAccurateECNState: UInt32, Equatable {
 @_spi(ProtocolProvider)
 @available(Network 0.1.0, *)
 public struct ProtocolEstablishmentReport: Equatable {
-    let handshakeMilliseconds: NetworkDuration
-    let handshakeRTTMilliseconds: NetworkDuration
-    let protocolIdentifier: ProtocolIdentifier
+    /// The time taken to establish the protocol, represented as a duration.
+    public let handshakeMilliseconds: NetworkDuration
+    /// The RTT estimate at establishment. QUIC captures the current path's smoothed RTT.
+    public let handshakeRTTMilliseconds: NetworkDuration
+    /// The protocol described by this report.
+    public let protocolIdentifier: ProtocolIdentifier
     let clientAccurateECNState: ClientAccurateECNState
     let serverAccurateECNState: ServerAccurateECNState
 

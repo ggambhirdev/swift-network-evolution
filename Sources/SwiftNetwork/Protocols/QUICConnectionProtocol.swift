@@ -1183,7 +1183,8 @@ public struct QUICConnectionProtocol: NetworkProtocol {
         QUICConnection(context: context).reference
     }
 
-    static let identifier = ProtocolIdentifier(name: "quic-connection", level: .transport, mapping: .manyToOne)
+    /// The identifier used by QUIC connection metadata and establishment reports.
+    public static let identifier = ProtocolIdentifier(name: "quic-connection", level: .transport, mapping: .manyToOne)
 
     #if !NETWORK_PRIVATE
     static let definition = ProtocolDefinition<QUICConnectionProtocol>(identifier: identifier)

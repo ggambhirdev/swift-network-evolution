@@ -28,10 +28,17 @@ public struct DataTransferSnapshot: Equatable {
     var receivedTransportOutOfOrderByteCount: UInt64 = 0
     var sentTransportByteCount: UInt64 = 0
     var sentTransportRetransmittedByteCount: UInt64 = 0
-    var sentTransportECNCapablePacketCount: UInt64 = 0
-    var sentTransportECNCapableAckedPacketCount: UInt64 = 0
-    var sentTransportECNCapableMarkedPacketCount: UInt64 = 0
-    var sentTransportECNCapableLostPacketCount: UInt64 = 0
+    /// The number of ECN-capable transport packets sent by this connection.
+    public internal(set) var sentTransportECNCapablePacketCount: UInt64 = 0
+    /// The number of sent ECN-capable transport packets acknowledged by the peer.
+    public internal(set) var sentTransportECNCapableAckedPacketCount: UInt64 = 0
+    /// The transport's accumulated congestion-experienced feedback count.
+    ///
+    /// QUIC accumulates validated cumulative CE feedback, so this value can count a
+    /// marked packet more than once across acknowledgments.
+    public internal(set) var sentTransportECNCapableMarkedPacketCount: UInt64 = 0
+    /// The number of sent ECN-capable transport packets declared lost.
+    public internal(set) var sentTransportECNCapableLostPacketCount: UInt64 = 0
 
     /// The transport's smoothed round-trip time. QUIC reports its current path's estimate.
     ///
