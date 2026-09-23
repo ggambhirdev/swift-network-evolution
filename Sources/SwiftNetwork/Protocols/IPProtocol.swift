@@ -55,6 +55,21 @@ public struct IPProtocol: NetworkProtocol {
         // Destination Address: UInt128
     }
 
+    // Byte offset of the checksum field within the IPv4 header (after version/
+    // IHL, DiffServ/ECN, total length, identification, fragment offset, TTL, and
+    // next-protocol). Used to place the header checksum (software or offloaded).
+    static public var ipv4ChecksumFieldOffset: Int {
+        10
+    }
+
+    static public var ipv4MinimumMTU: Int {
+        576
+    }
+
+    static public var ipv6MinimumMTU: Int {
+        1280
+    }
+
     public enum Version: UInt8 {
         /// Allows any IP version.
         case any = 0
@@ -463,7 +478,8 @@ public struct IPProtocol: NetworkProtocol {
 
             mutating func appendReassembledPackets(
                 _ log: borrowing NetworkLoggerState,
-                reassembled: inout FrameArray
+                reassembled: inout FrameArray,
+                now: NetworkClock.Instant?
             ) {
                 guard let empty = reassemblyState?.inputReassemblyFrames.isEmpty, !empty else {
                     return
@@ -622,8 +638,8 @@ public struct IPProtocol: NetworkProtocol {
                     newFrame.hopLimit = ttl
                 }
                 newFrame.metadataComplete = true
-                if self.flags.calculateReceiveTime {
-                    newFrame.timestamp = Frame.FrameTimestamp.receiveTime(.now)
+                if let now {
+                    newFrame.timestamp = Frame.FrameTimestamp.receiveTime(now)
                 }
                 reassembled.add(frame: newFrame)
 
@@ -637,13 +653,14 @@ public struct IPProtocol: NetworkProtocol {
                 _ log: borrowing NetworkLoggerState,
                 ipID: UInt16,
                 reassembled: inout FrameArray,
-                forceFlush: Bool
+                forceFlush: Bool,
+                now: NetworkClock.Instant?
             ) {
                 let hasAccumulatedFragments = reassemblyState?.inputReassemblyFrames.isEmpty == false
                 let isNewID = reassemblyState?.reassemblyID != ipID
 
                 if hasAccumulatedFragments && (isNewID || forceFlush) {
-                    appendReassembledPackets(log, reassembled: &reassembled)
+                    appendReassembledPackets(log, reassembled: &reassembled, now: now)
                     // Only discard buffered fragments when the IP ID changes
                     if isNewID && !forceFlush {
                         var dropped = 0
@@ -671,7 +688,11 @@ public struct IPProtocol: NetworkProtocol {
                 }
             }
 
-            mutating func processInboundFrames(_ log: borrowing NetworkLoggerState, _ inboundFrames: inout FrameArray) {
+            mutating func processInboundFrames(
+                _ log: borrowing NetworkLoggerState,
+                _ inboundFrames: inout FrameArray,
+                now: NetworkClock.Instant?
+            ) {
                 let localAddress: UInt32 = self.localAddress.addressValue
                 let remoteAddress: UInt32 = self.remoteAddress.addressValue
                 let mask = (0xF000_0000 as UInt32).bigEndian
@@ -783,8 +804,8 @@ public struct IPProtocol: NetworkProtocol {
                         /* Do nothing */
                         break
                     }
-                    if self.flags.calculateReceiveTime {
-                        frame.timestamp = Frame.FrameTimestamp.receiveTime(.now)
+                    if let now {
+                        frame.timestamp = Frame.FrameTimestamp.receiveTime(now)
                     }
                     if self.flags.receiveHopLimit {
                         frame.hopLimit = ttl
@@ -842,7 +863,13 @@ public struct IPProtocol: NetworkProtocol {
                         continue
                     }
 
-                    processReassembly(log, ipID: identifier, reassembled: &reassembledFragments, forceFlush: false)
+                    processReassembly(
+                        log,
+                        ipID: identifier,
+                        reassembled: &reassembledFragments,
+                        forceFlush: false,
+                        now: now
+                    )
                     let currentFragmentCount = reassemblyState?.inputReassemblyFrames.count ?? 0
                     guard currentFragmentCount < IPMaxFragmentCount else {
                         frame.finalize(success: false)
@@ -896,7 +923,7 @@ public struct IPProtocol: NetworkProtocol {
                     }
                     self.counters.rxPackets += 1
                 }
-                processReassembly(log, ipID: 0, reassembled: &reassembledFragments, forceFlush: true)
+                processReassembly(log, ipID: 0, reassembled: &reassembledFragments, forceFlush: true, now: now)
                 processedFrames.add(frames: reassembledFragments)
                 inboundFrames.add(frames: processedFrames)
             }
@@ -910,7 +937,7 @@ public struct IPProtocol: NetworkProtocol {
 
             func setChecksumValue(frame: inout Frame, value: UInt16) {
                 let checksumResult = Serializer.serialize(&frame, claim: false) { write throws(SerializationError) in
-                    try write.skip(10)
+                    try write.skip(IPProtocol.ipv4ChecksumFieldOffset)
                     try write.uint16(value)
                 }
                 if !checksumResult.isValid {
@@ -1111,7 +1138,8 @@ public struct IPProtocol: NetworkProtocol {
                             }
                         } else {
                             if self.flags.csumOffload {
-                                frame.checksumOffloadFlags = 0x04  // CSUM_IP
+                                // OR in CSUM_IP so we don't clobber a CSUM_PARTIAL flag.
+                                frame.checksumOffloadFlags |= 0x04  // CSUM_IP
                             } else {
                                 let checksumValue = try frame.ipChecksum(offset: 0, length: 20)
                                 self.setChecksumValue(frame: &frame, value: checksumValue)
@@ -1245,7 +1273,8 @@ public struct IPProtocol: NetworkProtocol {
 
             mutating func appendReassembledPackets(
                 _ log: borrowing NetworkLoggerState,
-                reassembled: inout FrameArray
+                reassembled: inout FrameArray,
+                now: NetworkClock.Instant?
             ) {
                 guard let empty = reassemblyState?.inputReassemblyFrames.isEmpty, !empty else {
                     return
@@ -1380,8 +1409,8 @@ public struct IPProtocol: NetworkProtocol {
                 if self.flags.receiveHopLimit {
                     newFrame.hopLimit = firstHopLimit
                 }
-                if self.flags.calculateReceiveTime {
-                    newFrame.timestamp = Frame.FrameTimestamp.receiveTime(.now)
+                if let now {
+                    newFrame.timestamp = Frame.FrameTimestamp.receiveTime(now)
                 }
                 newFrame.metadataComplete = true
                 reassembled.add(frame: newFrame)
@@ -1396,13 +1425,14 @@ public struct IPProtocol: NetworkProtocol {
                 _ log: borrowing NetworkLoggerState,
                 fragmentID: UInt32,
                 reassembled: inout FrameArray,
-                forceFlush: Bool
+                forceFlush: Bool,
+                now: NetworkClock.Instant?
             ) {
                 let hasAccumulatedFragments = reassemblyState?.inputReassemblyFrames.isEmpty == false
                 let isNewID = reassemblyState?.reassemblyID != fragmentID
 
                 if hasAccumulatedFragments && (isNewID || forceFlush) {
-                    appendReassembledPackets(log, reassembled: &reassembled)
+                    appendReassembledPackets(log, reassembled: &reassembled, now: now)
                     // Only discard buffered fragments when the IP ID change
                     if isNewID && !forceFlush {
                         var dropped = 0
@@ -1426,7 +1456,11 @@ public struct IPProtocol: NetworkProtocol {
                 }
             }
 
-            mutating func processInboundFrames(_ log: borrowing NetworkLoggerState, _ inboundFrames: inout FrameArray) {
+            mutating func processInboundFrames(
+                _ log: borrowing NetworkLoggerState,
+                _ inboundFrames: inout FrameArray,
+                now: NetworkClock.Instant?
+            ) {
 
                 let localAddress = self.localAddress.addressValue
                 let remoteAddress = self.remoteAddress.addressValue
@@ -1557,8 +1591,8 @@ public struct IPProtocol: NetworkProtocol {
                         /* Do nothing */
                         break
                     }
-                    if self.flags.calculateReceiveTime {
-                        frame.timestamp = Frame.FrameTimestamp.receiveTime(.now)
+                    if let now {
+                        frame.timestamp = Frame.FrameTimestamp.receiveTime(now)
                     }
                     if self.flags.receiveHopLimit {
                         frame.hopLimit = hopLimit
@@ -1639,7 +1673,8 @@ public struct IPProtocol: NetworkProtocol {
                         log,
                         fragmentID: fragmentID,
                         reassembled: &reassembledFragments,
-                        forceFlush: false
+                        forceFlush: false,
+                        now: now
                     )
 
                     let currentFragmentCount = reassemblyState?.inputReassemblyFrames.count ?? 0
@@ -1685,7 +1720,13 @@ public struct IPProtocol: NetworkProtocol {
                     }
                     self.counters.rxPackets += 1
                 }
-                processReassembly(log, fragmentID: 0, reassembled: &reassembledFragments, forceFlush: true)
+                processReassembly(
+                    log,
+                    fragmentID: 0,
+                    reassembled: &reassembledFragments,
+                    forceFlush: true,
+                    now: now
+                )
                 processedFrames.add(frames: reassembledFragments)
                 inboundFrames.add(frames: processedFrames)
             }
@@ -1936,7 +1977,7 @@ public struct IPProtocol: NetworkProtocol {
             if let path {
                 maximumMessageSize = path.maximumPacketSize
                 mtu = path.mtu
-                flags.csumOffload = (path.hardwareChecksumFlags & 0x0000_0001) != 0
+                flags.csumOffload = (path.hardwareChecksumFlags & IfnetHardwareAssistFlags.ifnetIPHeader) != 0
                 if let interface = path.directInterface {
                     netmask = interface.ipv4Netmask?.addressValue ?? 0
                     broadcast = interface.ipv4Broadcast?.addressValue ?? 0
@@ -1990,7 +2031,7 @@ public struct IPProtocol: NetworkProtocol {
             IPInstance.drainReassemblyQueue(&instanceType)
         }
 
-        @inline(__always)
+        @inline(always)
         private static func drainReassemblyQueue(_ instanceType: inout IPInstanceType) {
             // Make sure that there are no left over frames stranded in the reassembly queue
             switch instanceType {
@@ -2015,7 +2056,12 @@ public struct IPProtocol: NetworkProtocol {
                 guard var inboundFrames, !inboundFrames.isEmpty else {
                     return nil
                 }
-                IPInstance.processInbound(&self.instanceType, log: self.log, frames: &inboundFrames)
+                IPInstance.processInbound(
+                    &self.instanceType,
+                    log: self.log,
+                    frames: &inboundFrames,
+                    now: NetworkClock.Instant.now
+                )
                 guard !inboundFrames.isEmpty else {
                     log.error("Dropped inbound packets, checking for more")
                     continue
@@ -2060,23 +2106,31 @@ public struct IPProtocol: NetworkProtocol {
             try invokeSendDatagrams(datagrams)
         }
 
-        @inline(__always)
+        /// - Parameter now: Read lazily, and only when something will use it. Every consumer of
+        ///   this instant is behind `calculateReceiveTime`, so reading the clock unconditionally
+        ///   would charge a clock read to every inbound batch of a stack that never asks for
+        ///   receive timestamps. Resolved once here, so the frames of a batch still share one
+        ///   instant, and passed down as `nil` when nothing will stamp a frame.
+        @inline(always)
         private static func processInbound(
             _ instanceType: inout IPInstanceType,
             log: borrowing NetworkLoggerState,
-            frames: inout FrameArray
+            frames: inout FrameArray,
+            now: @autoclosure () -> NetworkClock.Instant
         ) {
             switch instanceType {
             case .ipv4(var instance):
-                instance.processInboundFrames(log, &frames)
+                let receiveTime = instance.flags.calculateReceiveTime ? now() : nil
+                instance.processInboundFrames(log, &frames, now: receiveTime)
                 instanceType = .ipv4(instance)
             case .ipv6(var instance):
-                instance.processInboundFrames(log, &frames)
+                let receiveTime = instance.flags.calculateReceiveTime ? now() : nil
+                instance.processInboundFrames(log, &frames, now: receiveTime)
                 instanceType = .ipv6(instance)
             }
         }
 
-        @inline(__always)
+        @inline(always)
         private static func processOutbound(
             _ instanceType: inout IPInstanceType,
             lower: OutboundDatagramLinkage,

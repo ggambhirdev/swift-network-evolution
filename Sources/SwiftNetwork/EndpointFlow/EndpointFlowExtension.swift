@@ -233,6 +233,20 @@ extension EndpointFlow {
                 if stack.applicationProtocols.count == 0 {
                     if let link = stack.link {
                         switch link {
+                        case .customLink(let options):
+                            let reference = CustomLinkProtocol.instance(context: context)
+                            options.setProtocolInstance(reference)
+                            let linkage = OutboundStreamLinkage(reference: reference)
+                            let flow = try StreamEndpointFlowProtocol(
+                                identifier: String(self.identifier),
+                                local: effectiveLocalEndpoint,
+                                remote: self.remoteEndpoint,
+                                parameters: self.parameters,
+                                path: path,
+                                context: context,
+                                lowerStreamProtocol: linkage
+                            )
+                            self.flowProtocol = .stream(flow)
                         case .custom(let options):
                             // TODO: It'd be nice if we could do this w/o checking for specific protocols here,
                             // but we're not there quite yet
@@ -286,6 +300,16 @@ extension EndpointFlow {
                         )
                         if let link = stack.link {
                             switch link {
+                            case .customLink(let options):
+                                let customLinkReference = CustomLinkProtocol.instance(context: context)
+                                options.setProtocolInstance(reference)
+                                try reference.attachLowerStreamProtocol(
+                                    customLinkReference,
+                                    remote: effectiveRemoteEndpoint,
+                                    local: effectiveLocalEndpoint,
+                                    parameters: self.parameters,
+                                    path: path
+                                )
                             case .custom(let options):
                                 // TODO: It'd be nice if we could do this w/o checking for specific protocols here,
                                 // but we're not there quite yet

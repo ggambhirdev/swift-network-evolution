@@ -83,7 +83,7 @@ extension System {
 
     #if !NETWORK_STANDALONE || NETWORK_DRIVERKIT
 
-    @inline(__always)
+    @inline(always)
     @discardableResult
     static func syscallForbiddingEINVAL<T: FixedWidthInteger>(
         where function: String = #function,
@@ -112,7 +112,7 @@ extension System {
         }
     }
 
-    @inline(__always)
+    @inline(always)
     @discardableResult
     static func syscall<T: FixedWidthInteger>(
         blocking: Bool,
@@ -140,7 +140,7 @@ extension System {
         }
     }
 
-    @inline(__always)
+    @inline(always)
     @discardableResult
     static func syscallOptional<T>(
         where function: String = #function,

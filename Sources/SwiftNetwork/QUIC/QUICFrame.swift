@@ -736,21 +736,36 @@ struct FramePadding: ~Copyable, QUICFrameProtocol {
     private mutating func countZeros(frame: inout Frame) throws(QUICError) {
         var extraPadding = 0
 
-        if let bytes = frame.span {
-            let count = bytes.count
-            for byte in 0..<count {
-                if bytes[byte] == 0x00 {
-                    extraPadding += 1
-                } else {
-                    break
-                }
-            }
+        if let bytes = frame.bytes {
+            extraPadding = Self.countLeadingZeroBytes(bytes)
         }
 
         guard frame.claim(fromStart: extraPadding) else {
             throw QUICError.frameParse(FrameParseError.parsingError)
         }
         self.extraPadding = extraPadding
+    }
+
+    private static func countLeadingZeroBytes(_ bytes: RawSpan) -> Int {
+        let count = bytes.byteCount
+        let wordSize = MemoryLayout<UInt64>.size
+        var offset = 0
+
+        while offset &+ wordSize <= count {
+            let word = bytes.unsafeLoadUnaligned(fromByteOffset: offset, as: UInt64.self)
+
+            if word == 0 {
+                offset &+= wordSize
+            } else {
+                return offset &+ (UInt64(littleEndian: word).trailingZeroBitCount / 8)
+            }
+        }
+
+        while offset < count, bytes[offset] == 0x00 {
+            offset &+= 1
+        }
+
+        return offset
     }
 
     static func write(frame: inout Frame, length: Int) throws(QUICError) {
@@ -829,44 +844,36 @@ struct FrameAckRange {
 }
 
 @available(Network 0.1.0, *)
-struct FrameAck: QUICFrameProtocol {
-    var type = FrameType.ack
+struct FrameAck: ~Copyable, QUICFrameProtocol {
 
-    var packetNumberSpace: PacketNumberSpace
-
+    var ranges: [FrameAckRange]
     var largest = PacketNumber.none
+    var pendingGap: PacketNumber = .none
+    private var _ecnCounter: ECNCounter = ECNCounter(ect0: 0, ect1: 0, ce: 0)
+    var packetNumberSpace: PacketNumberSpace
 
     // Cap ack delay value, which is in microseconds.
     // The cap avoids handling values of microseconds that
     // would cause overflows when turned into nanoseconds, etc.
     // Capping at UInt32.max microseconds makes this limited
     // to around 1.2 hours.
-    private var _delay: UInt64 = 0
-    static let maximumAllowedAckDelay = UInt64(UInt32.max)
+    private var _delay: UInt32 = 0
     var delay: UInt64 {
-        get { _delay }
+        get { UInt64(_delay) }
         set {
-            guard newValue <= FrameAck.maximumAllowedAckDelay else {
-                _delay = FrameAck.maximumAllowedAckDelay
+            guard newValue <= UInt64(Constants.maximumAllowedAckDelay) else {
+                _delay = Constants.maximumAllowedAckDelay
                 return
             }
-            _delay = newValue
+            _delay = UInt32(clamping: newValue)
         }
     }
-    var ranges: [FrameAckRange]
-    var pendingGap: PacketNumber?
-    private var _ecnCounter: ECNCounter?
+    // Derive the type from ECN counters being empty
+    @inline(always)
+    var type: FrameType { _ecnCounter.isEmpty ? .ack : .ackECN }
     var ecnCounter: ECNCounter? {
-        get { _ecnCounter }
-        set {
-            if let newValue, !newValue.isEmpty {
-                type = .ackECN
-                _ecnCounter = newValue
-            } else {
-                type = .ack
-                _ecnCounter = nil
-            }
-        }
+        get { _ecnCounter.isEmpty ? nil : _ecnCounter }
+        set { _ecnCounter = newValue ?? ECNCounter(ect0: 0, ect1: 0, ce: 0) }
     }
 
     static func parse(
@@ -884,7 +891,6 @@ struct FrameAck: QUICFrameProtocol {
     init(packetNumberSpace: PacketNumberSpace, largest: PacketNumber, delay: UInt64) {
         self.packetNumberSpace = packetNumberSpace
         self.ranges = .init()
-        self.ranges.reserveCapacity(4)
         self.largest = largest
         self.delay = delay
     }
@@ -900,11 +906,7 @@ struct FrameAck: QUICFrameProtocol {
     }
 
     private mutating func validateAckType(_ rawType: UInt64) throws(QUICError) {
-        if rawType == FrameType.ack.rawValue {
-            type = FrameType.ack
-        } else if rawType == FrameType.ackECN.rawValue {
-            type = FrameType.ackECN
-        } else {
+        guard rawType == FrameType.ack.rawValue || rawType == FrameType.ackECN.rawValue else {
             throw QUICError.frameParse(FrameParseError.invalidType(rawType))
         }
     }
@@ -946,7 +948,7 @@ struct FrameAck: QUICFrameProtocol {
         }
         try validateDeserializationResult(rangeResult)
 
-        if type == .ackECN {
+        if rawType == FrameType.ackECNCode {
             // Parse ECN-specific fields
             var ecnCounter = ECNCounter(ect0: 0, ect1: 0, ce: 0)
             let ecnResult = Deserializer.deserialize(&frame, claim: true) { read throws(DeserializationError) in
@@ -1009,17 +1011,13 @@ struct FrameAck: QUICFrameProtocol {
     }
 
     mutating func addRange(gap: PacketNumber = .initial, range: PacketNumber) {
-        if let pendingGap = pendingGap {
+        if pendingGap != .none {
             ranges.append(FrameAckRange(gap: pendingGap, range: range))
-            self.pendingGap = nil
+            pendingGap = .none
         } else {
             ranges.append(FrameAckRange(gap: .initial, range: range))
         }
-        if gap != 0 {
-            pendingGap = gap
-        } else {
-            pendingGap = nil
-        }
+        pendingGap = gap != 0 ? gap : .none
     }
 
     mutating func setDelay(_ delay: UInt64) {
@@ -1683,7 +1681,7 @@ extension FrameStreamFlag {
 
 // Only used for sending (or re-sending) STREAM frames
 @available(Network 0.1.0, *)
-struct FrameStreamSendMetadata: QUICFrameProtocol {
+struct FrameStreamSendMetadata: ~Copyable, QUICFrameProtocol {
     let type: FrameType
 
     // Write STREAM frame into outbound `frame` from the stream's sendBuffer

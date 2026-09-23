@@ -1010,9 +1010,72 @@ public struct StreamBridge: StreamProtocol {
 
 @_spi(Essentials)
 @available(Network 0.1.0, *)
+public struct CustomLink: StreamProtocol {
+    public typealias ContentType = Void
+
+    private var tx: ((Span<UInt8>) -> Void)? = nil
+    private var rx: ((@escaping (Span<UInt8>) -> Void) -> Void)? = nil
+
+    public let belowProtocol: Void
+    /// Configure CustomLink for tx byte handling
+    ///
+    /// The handler will be called when outgoing bytes arrive at
+    /// the CustomLink protocol in the protocol stack.
+    ///
+    /// Note: handler will be called in the context of the protocol
+    /// stack, so handler must not block to ensure the networking layer
+    /// continues to process incoming and outgoing data.
+    ///
+    /// - Parameter handler: A closure that will be called with a
+    /// span of bytes to be written to the network.
+    public func tx(_ handler: @escaping (Span<UInt8>) -> Void) -> Self {
+        var mutableSelf = self
+        mutableSelf.tx = handler
+        return mutableSelf
+    }
+
+    /// Configure CustomLink for rx byte handling
+    ///
+    /// The handler will be called when CustomLinkProtocol
+    /// initializes. It passes in an escaping closure that can
+    /// be called whenever bytes need to be injected into
+    /// CustomLinkProtocol.
+    ///
+    /// Note: handler will be called in the context of the protocol
+    /// stack, so handler must not block to ensure the networking layer
+    /// continues to process incoming and outgoing data. A typical
+    /// implementation will store the escaping closure for later use and
+    /// return.
+    ///
+    /// - Parameter handler: A closure that will be called with an
+    /// escaping closure that should be stored for later use when bytes
+    /// need to be injected into the protocol stack.
+    public func rx(_ handler: @escaping ((@escaping (Span<UInt8>) -> Void) -> Void)) -> Self {
+        var mutableSelf = self
+        mutableSelf.rx = handler
+        return mutableSelf
+    }
+
+    init() {
+    }
+
+    public func configure(parameters: Parameters) {
+        let options = ProtocolOptions<CustomLinkProtocol>(
+            protocolIdentifier: CustomLinkProtocol.identifier,
+            perProtocolOptions: CustomLinkProtocol.Options()
+        )
+        options.tx = tx
+        options.rx = rx
+        parameters.defaultStack.link = .customLink(options)
+    }
+}
+
+@_spi(Essentials)
+@available(Network 0.1.0, *)
 public struct NoTransport: StreamProtocol {
     public enum BelowProtocol {
         case void
+        case customLink(CustomLink)
         #if !NETWORK_EMBEDDED
         case bridge(StreamBridge)
         #endif
@@ -1030,12 +1093,18 @@ public struct NoTransport: StreamProtocol {
     }
     #endif
 
+    public init(@ProtocolStackBuilder<CustomLink> _ builder: () -> (CustomLink)) {
+        belowProtocol = .customLink(builder())
+    }
+
     public func configure(parameters: Parameters) {
         switch belowProtocol {
         #if !NETWORK_EMBEDDED
         case .bridge(let bridge):
             bridge.configure(parameters: parameters)
         #endif
+        case .customLink(let customLink):
+            customLink.configure(parameters: parameters)
         case .void:
             break
         }
@@ -2106,6 +2175,21 @@ extension NetworkChannel where ApplicationProtocol: StreamProtocol {
         public let isComplete: Bool
     }
 
+    public struct StreamSpanMessage: ~Escapable {
+        @_lifetime(borrow content)
+        init(content: RawSpan? = nil, offset: Int = 0, isComplete: Bool = false, lastChunkOfBatch: Bool = false) {
+            self.content = content
+            self.offset = offset
+            self.isComplete = isComplete
+            self.lastChunkOfBatch = lastChunkOfBatch
+        }
+
+        public let content: RawSpan?
+        public let offset: Int
+        public let isComplete: Bool
+        public let lastChunkOfBatch: Bool
+    }
+
     public func send(_ message: StreamMessage, completion: (@Sendable (Result<Void, NetworkError>) -> Void)? = nil) {
         let endpointFlow = self.endpointFlow
         endpointFlow.async {
@@ -2141,15 +2225,48 @@ extension NetworkChannel where ApplicationProtocol: StreamProtocol {
         atMost maxBytes: Int,
         completion: @escaping @Sendable (Result<StreamMessage, NetworkError>) -> Void
     ) {
-        let readRequest = ReadRequest(minimumBytes: minBytes, maximumBytes: maxBytes, maximumFrames: Int.max) {
-            (content, isComplete, isFinal, error) in
-            if let error = error {
-                completion(.failure(error))
-            } else {
-                completion(.success(.message(content: content, isComplete: isComplete)))
+        let endpointFlow = self.endpointFlow
+        endpointFlow.async {
+            let readRequest = ReadRequest(minimumBytes: minBytes, maximumBytes: maxBytes) {
+                (content, isComplete, isFinal, error) in
+                if let error = error {
+                    completion(.failure(error))
+                } else {
+                    completion(.success(.message(content: content, isComplete: isComplete)))
+                }
             }
+            self.endpointFlow.addReadRequestOnContext(readRequest)
         }
-        self.endpointFlow.addReadRequest(readRequest)
+    }
+
+    public func receive(
+        atLeast minBytes: Int,
+        atMost maxBytes: Int,
+        maximumChunks: Int,
+        completion: @escaping @Sendable (Result<StreamSpanMessage, NetworkError>) -> Void
+    ) {
+        let endpointFlow = self.endpointFlow
+        endpointFlow.async {
+            let readRequest = ReadRequest(minimumBytes: minBytes, maximumBytes: maxBytes, maximumFrames: maximumChunks)
+            {
+                (content, offset, isComplete, isFinal, lastChunkOfBatch, error) in
+                if let error = error {
+                    completion(.failure(error))
+                } else {
+                    completion(
+                        .success(
+                            .init(
+                                content: content,
+                                offset: offset,
+                                isComplete: isComplete,
+                                lastChunkOfBatch: lastChunkOfBatch
+                            )
+                        )
+                    )
+                }
+            }
+            self.endpointFlow.addReadRequestOnContext(readRequest)
+        }
     }
 }
 
@@ -2191,14 +2308,17 @@ extension NetworkChannel where ApplicationProtocol: DatagramProtocol {
     }
 
     public func receive(completion: @escaping @Sendable (Result<DatagramMessage, NetworkError>) -> Void) {
-        let readRequest = ReadRequest(minimumBytes: 1, maximumBytes: Int.max, maximumFrames: 1) {
-            (content, isComplete, isFinal, error) in
-            if let error = error {
-                completion(.failure(error))
-            } else {
-                completion(.success(.message(content: content)))
+        let endpointFlow = self.endpointFlow
+        endpointFlow.async {
+            let readRequest = ReadRequest(maximumFrames: 1) {
+                (content, isComplete, isFinal, error) in
+                if let error = error {
+                    completion(.failure(error))
+                } else {
+                    completion(.success(.message(content: content)))
+                }
             }
+            self.endpointFlow.addReadRequestOnContext(readRequest)
         }
-        self.endpointFlow.addReadRequest(readRequest)
     }
 }

@@ -30,7 +30,7 @@ struct Migration: ~Copyable {
 
     private func sendPendingChallenges(
         connection: QUICConnection,
-        now: NetworkClock.Instant = NetworkClock.Instant.now
+        now: NetworkClock.Instant
     ) {
         connection.applyToAllPaths { path in
             if path.hasPendingItems(now: now) {
@@ -39,13 +39,12 @@ struct Migration: ~Copyable {
         }
     }
 
-    func resetTimer(connection: QUICConnection) {
+    func resetTimer(now: NetworkClock.Instant, connection: QUICConnection) {
         guard let timerID else {
             connection.log.fault("Attempt to arm the migration timer when timer ID is unset")
             return
         }
 
-        let now = NetworkClock.Instant.now
         sendPendingChallenges(connection: connection, now: now)
 
         var firstChallengeTime: NetworkClock.Instant?
@@ -72,7 +71,7 @@ struct Migration: ~Copyable {
             connection.timer.reschedule(
                 identifier: timerID,
                 fromNow: .zero,
-                timerNow: connection.now
+                timerNow: now
             )
             return
         }
@@ -85,14 +84,17 @@ struct Migration: ~Copyable {
         connection.timer.reschedule(
             identifier: timerID,
             fromNow: duration,
-            timerNow: connection.now
+            timerNow: now
         )
     }
 
-    func timerFired(connection: QUICConnection) {
+    func timerFired(at firedAt: NetworkClock.Instant, connection: QUICConnection) {
         connection.log.debug("Migration timer fired")
 
-        sendPendingChallenges(connection: connection)
+        // The timer must be re-armed even when no challenge is due: `Timer` fires up to
+        // `Timer.timerThreshold` early and has already disabled the entry, so an early wakeup would
+        // otherwise stall probing. `resetTimer` sends whatever is due before arming.
+        resetTimer(now: firedAt, connection: connection)
     }
 
     func migrate(to path: QUICPath, connection: QUICConnection) {
@@ -110,7 +112,7 @@ struct Migration: ~Copyable {
         connection.log.notice("Migrating to path \(path.identifier)")
         connection.currentPath = path
         path.spinValue = connection.initialSpinValue
-        connection.recovery.resetTimer(connection: connection)
+        connection.recovery.resetTimer(now: connection.now, connection: connection)
         path.resetPacer()
         path.pmtudState.start(on: path)
         connection.applyToAllPaths { otherPath in
@@ -202,7 +204,7 @@ extension QUICConnection {
             if isServer, path != currentPath, !path.isValidated {
                 path.beginValidation()
                 sendFrames(on: path)
-                migration.resetTimer(connection: self)
+                migration.resetTimer(now: self.now, connection: self)
             }
             break
         case .unavailable:
@@ -223,6 +225,21 @@ extension QUICConnection {
                 "Path \(path.identifier) \(path.state) over \(path.interface?.description ?? "nil")"
             )
         }
+        // Notify the stack about a path change event
+        if case .available(let local, let remote, _, _) = event,
+            let local, let remote,
+            case .address(let localAddress) = local.type,
+            case .address(let remoteAddress) = remote.type
+        {
+            path.localEndpoint = local
+            path.remoteEndpoint = remote
+            let pathInfo = QUICPathInfo(
+                isValidated: path.isValidated,
+                remote: remoteAddress,
+                local: localAddress
+            )
+            deliverNetworkProtocolEvent(flow: .allFlows, event: .init(quicEvent: .pathChanged(pathInfo)))
+        }
 
         // This is a new primary path. Migrate to it if we are the client.
         if !isServer, path != currentPath, isPrimary, path.isRouteEstablished {
@@ -235,12 +252,12 @@ extension QUICConnection {
     // Retires a path's outbound CID and queues a RETIRE_CONNECTION_ID frame for it.
     func retireOutboundCID(forPathGoingAway path: QUICPath) {
         guard path.isOpenForSending, !path.hasPreAssignedCIDs, let dcid = path.dcid,
-            let sequence = remoteCIDs.retire(connectionID: dcid)
+            let retiredCID = remoteCIDs.retire(connectionID: dcid)
         else {
             return
         }
         withPendingItems(for: .applicationData) {
-            $0.addRetireConnectionID(FrameRetireConnectionID(sequence: sequence))
+            $0.addRetireConnectionID(FrameRetireConnectionID(sequence: retiredCID.sequenceNumber))
         }
     }
 

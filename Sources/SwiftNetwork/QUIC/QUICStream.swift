@@ -892,7 +892,7 @@ public final class QUICStreamInstance: MultiplexedStreamFlow<QUICConnection>,
                 return nil
             }
         }
-        var frameArray = FrameArray()
+        var frameArray = FrameArray(capacity: reassemblyQueue.items.count)
         var writtenCount: Int = 0
         while let item = reassemblyQueue.dequeue() {
             if writtenCount + item.length > totalLength {
@@ -943,6 +943,15 @@ public final class QUICStreamInstance: MultiplexedStreamFlow<QUICConnection>,
 
         // Record with flow control that bytes have been delivered, and update flow credits.
         deliveredInboundBytes(consumedLength: bytes, connection: parentProtocol)
+
+        // This notification is delivered from the application's read, which runs after the
+        // inbound batch has already been serviced and flushed. If the read opened up the
+        // receive window, we should send the credit here.
+        if parentProtocol.applicationPendingItems.maxData
+            || parentProtocol.applicationPendingItems.maxStreamData
+        {
+            parentProtocol.sendFrames()
+        }
 
         if let streamID {
             QUICSignpost.dataDelivered(id: parentProtocol.signpostID, streamID: streamID.value, nbytes: bytes)
@@ -1068,7 +1077,7 @@ public final class QUICStreamInstance: MultiplexedStreamFlow<QUICConnection>,
         sendBuffer.hasMoreSendDataToService(currentSendOffset: sendOffset)
     }
 
-    @inline(__always)
+    @inline(always)
     var remainingSendDataToService: UInt64 {
         sendBuffer.remainingDataLengthToService(currentSendOffset: sendOffset)
     }

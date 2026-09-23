@@ -161,8 +161,11 @@ struct Prague: CongestionControlProtocol, CubicLikeProtocol {
         cubicK = K
     }
 
-    private mutating func getCubicTarget(mss: Int, smoothedRTT: NetworkDuration) -> UInt64 {
-        let now = NetworkClock.Instant.now
+    private mutating func getCubicTarget(
+        mss: Int,
+        smoothedRTT: NetworkDuration,
+        now: NetworkClock.Instant
+    ) -> UInt64 {
         if cubicEpochStart == .zero {
             // If we exit slow start without any packet loss, CUBIC switches to CA
             // where t is the elapsed time since the beginning of the current CA.
@@ -211,12 +214,13 @@ struct Prague: CongestionControlProtocol, CubicLikeProtocol {
     private mutating func cubicProcessAckCA(
         bytesAcked: UInt64,
         smoothedRTT: NetworkDuration,
-        mss: Int
+        mss: Int,
+        now: NetworkClock.Instant
     ) {
         cubicAcked += bytesAcked
 
         // compute W(t+RTT)
-        let wCubicNext = getCubicTarget(mss: mss, smoothedRTT: smoothedRTT)
+        let wCubicNext = getCubicTarget(mss: mss, smoothedRTT: smoothedRTT, now: now)
 
         updateRenoCongestionWindow(bytesAcked: bytesAcked, mss: mss)
 
@@ -300,33 +304,30 @@ struct Prague: CongestionControlProtocol, CubicLikeProtocol {
         guard let path, path.pacer.enabled else {
             return
         }
-        var sRTT = smoothedRTT.microseconds
-        if sRTT == 0 {
-            sRTT = pacingInitialRTT.microseconds
-        }
-        var rate = congestionWindow
+
+        // A short RTT can round to zero: `RTT.processNewSample` stores the sample as whole
+        // microseconds, so an ack duration under 500ns becomes 0µs and dividing by it below would
+        // trap. Fall back to the initial estimate.
+        let smoothedRTTInMicroseconds =
+            smoothedRTT.microseconds == 0 ? pacingInitialRTT.microseconds : smoothedRTT.microseconds
 
         // Use 200% rate when in slow start
-        if congestionWindow < slowStartThreshold {
-            rate *= 2
-        }
+        let pacedWindow = congestionWindow < slowStartThreshold ? congestionWindow * 2 : congestionWindow
+        let rateInBytesPerSecond =
+            pacedWindow * System.Time.USEC_PER_SEC / UInt64(smoothedRTTInMicroseconds)
+        let burstSize = rateInBytesPerSecond >> burstQueueShift
 
-        // Multiply by USEC_PER_SEC as sRTT is in microseconds
-        rate = (rate * System.Time.USEC_PER_SEC) / UInt64(sRTT)
-        let burst = rate >> burstQueueShift
-
-        path.pacer.setRate(rate: rate)
-        path.pacer.setBurstSize(burstSize: UInt32(truncatingIfNeeded: burst))
+        path.pacer.setRate(rate: rateInBytesPerSecond)
+        path.pacer.setBurstSize(burstSize: UInt32(truncatingIfNeeded: burstSize))
     }
 
     private func packetInRecovery(sentTime: NetworkClock.Instant) -> Bool {
         sentTime <= recoveryStartTime
     }
 
-    mutating func enterRecovery(mss: Int, qlog: QLog? = nil) {
+    mutating func enterRecovery(mss: Int, now: NetworkClock.Instant, qlog: QLog? = nil) {
         log.datapath("Entering Recovery: current cwin=\(congestionWindow)")
-        let timeNow = NetworkClock.Instant.now
-        recoveryStartTime = timeNow
+        recoveryStartTime = now
         cubicLastMaxCongestionWindow = cubicMaxCongestionWindow
         cubicMaxCongestionWindow = congestionWindow
 
@@ -354,7 +355,7 @@ struct Prague: CongestionControlProtocol, CubicLikeProtocol {
         // Note that K = 0 if we enter CA without loss.
         setCubicK(mss: mss)
         // Set the start of current CA and the origin point
-        cubicEpochStart = timeNow
+        cubicEpochStart = now
         cubicOriginPoint = cubicMaxCongestionWindow
         // Reset renoCongestionWindow to be in sync with Prague
         renoCongestionWindow = congestionWindow
@@ -462,6 +463,7 @@ struct Prague: CongestionControlProtocol, CubicLikeProtocol {
     private mutating func pragueCongestionEvent(
         sentTime: NetworkClock.Instant,
         mss: Int,
+        now: NetworkClock.Instant,
         qlog: QLog? = nil
     ) -> Bool {
         // If the packet was sent before recovery started, do nothing
@@ -469,7 +471,7 @@ struct Prague: CongestionControlProtocol, CubicLikeProtocol {
             return false
         }
 
-        enterRecovery(mss: mss, qlog: qlog)
+        enterRecovery(mss: mss, now: now, qlog: qlog)
         return true
     }
 
@@ -480,12 +482,14 @@ struct Prague: CongestionControlProtocol, CubicLikeProtocol {
         largestLostSentTime: NetworkClock.Instant,
         mss: Int,
         smoothedRTT: NetworkDuration,
+        now: NetworkClock.Instant,
         qlog: QLog? = nil
     ) -> Bool {
         decrementBytesInFlight(UInt64(bytesLost))
         let reducedCongestionWindow = pragueCongestionEvent(
             sentTime: largestLostSentTime,
             mss: mss,
+            now: now,
             qlog: qlog
         )
         updatePacerState(path: path, smoothedRTT: smoothedRTT)
@@ -497,6 +501,7 @@ struct Prague: CongestionControlProtocol, CubicLikeProtocol {
         path: QUICPath? = nil,
         mss: Int,
         packetsLost: Bool,
+        now: NetworkClock.Instant,
         qlog: QLog? = nil
     ) {
         if packetsLost {
@@ -511,7 +516,7 @@ struct Prague: CongestionControlProtocol, CubicLikeProtocol {
         }
 
         let smoothedRTT = rtt.smoothedRTT
-        if !revalidateCongestionWindow(smoothedRTT: smoothedRTT) {
+        if !revalidateCongestionWindow(smoothedRTT: smoothedRTT, now: now) {
             bytesAcked = 0
             return
         }
@@ -522,7 +527,7 @@ struct Prague: CongestionControlProtocol, CubicLikeProtocol {
             if reducedDueToCE {
                 pragueCAAfterCE(bytesAcked: bytesAcked, mss: mss)
             } else {
-                cubicProcessAckCA(bytesAcked: bytesAcked, smoothedRTT: smoothedRTT, mss: mss)
+                cubicProcessAckCA(bytesAcked: bytesAcked, smoothedRTT: smoothedRTT, mss: mss, now: now)
             }
         }
 
@@ -543,6 +548,7 @@ struct Prague: CongestionControlProtocol, CubicLikeProtocol {
         largestAckedSentTime: NetworkClock.Instant,
         mss: Int,
         smoothedRTT: NetworkDuration,
+        now: NetworkClock.Instant,
         qlog: QLog? = nil
     ) {
         if _slowPath(ceCount < ecnCECounter) {

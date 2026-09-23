@@ -228,52 +228,6 @@ public protocol DomainSpecificApplicationEvent: Sendable, Equatable {
 
 @_spi(ProtocolProvider)
 @available(Network 0.1.0, *)
-public enum QUICEvent: DomainSpecificNetworkProtocolEvent {
-    public var domain: NetworkEventDomain { .init(domain: "QUIC") }
-
-    #if !NETWORK_NO_SWIFT_QUIC
-    case newInboundConnectionID(_ connectionID: QUICConnectionID)
-    case retiredInboundConnectionID(_ connectionID: QUICConnectionID)
-    case newOutboundConnectionID(_ connectionID: QUICConnectionID)
-    case retiredOutboundConnectionID(_ connectionID: QUICConnectionID)
-    #endif
-    case remoteBidirectionalStreamsBlocked(maximumStreams: Int)
-    case remoteUnidirectionalStreamsBlocked(maximumStreams: Int)
-    case maxStreamsLimitBidirectionalUpdated(maximumStreams: Int)
-    case maxStreamsLimitUnidirectionalUpdated(maximumStreams: Int)
-    case earlyDataRejected
-    case receivedRemoteTransportParameters(transportParameters: [UInt8])
-
-    public var description: String {
-        switch self {
-        #if !NETWORK_NO_SWIFT_QUIC
-        case .newInboundConnectionID(let connectionID):
-            return "QUIC: New inbound connection ID: \(connectionID)"
-        case .retiredInboundConnectionID(let connectionID):
-            return "QUIC: Retired inbound connection ID: \(connectionID)"
-        case .newOutboundConnectionID(let connectionID):
-            return "QUIC: New outbound connection ID: \(connectionID)"
-        case .retiredOutboundConnectionID(let connectionID):
-            return "QUIC: Retired outbound connection ID: \(connectionID)"
-        #endif
-        case .remoteBidirectionalStreamsBlocked(let maximumStreams):
-            return "QUIC: Remote bidirectional streams blocked: \(maximumStreams)"
-        case .remoteUnidirectionalStreamsBlocked(let maximumStreams):
-            return "QUIC: Remote unidirectional streams blocked: \(maximumStreams)"
-        case .maxStreamsLimitBidirectionalUpdated(let maximumStreams):
-            return "QUIC: Remote bidirectional stream limit updated to: \(maximumStreams)"
-        case .maxStreamsLimitUnidirectionalUpdated(let maximumStreams):
-            return "QUIC: Remote unidirectional stream limit updated to: \(maximumStreams)"
-        case .earlyDataRejected:
-            return "QUIC: Early data rejected"
-        case .receivedRemoteTransportParameters:
-            return "QUIC: Received remote transport parameters"
-        }
-    }
-}
-
-@_spi(ProtocolProvider)
-@available(Network 0.1.0, *)
 extension NetworkProtocolEvent {
     public var quicEvent: QUICEvent? {
         guard case .quic(let quicEvent) = internalEvent else {

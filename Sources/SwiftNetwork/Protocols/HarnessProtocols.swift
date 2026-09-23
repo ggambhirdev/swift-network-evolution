@@ -759,6 +759,9 @@ public class NewFlowHarness<LinkageType: InboundFlowLinkage, HarnessType: UpperH
         public var disconnected: (() -> Void)?
         var newFlow = Deque<(() -> Void)>()
         public var error: ((NetworkError) -> Void)?  // invoked when error detected
+        public var pathChanged: ((QUICPathInfo) -> Void)?
+        public var pathValidated: ((QUICPathInfo) -> Void)?
+        public var pathUnreachable: ((QUICPathInfo) -> Void)?
         public init() {}
     }
     public var completions: Completions = .init()
@@ -812,13 +815,39 @@ public class NewFlowHarness<LinkageType: InboundFlowLinkage, HarnessType: UpperH
 
     public var newInboundCIDEventCount = 0
     public var newOutboundCIDEventCount = 0
+    public var retiredOutboundCIDEventCount = 0
+    #if !NETWORK_NO_SWIFT_QUIC
+    public var lastNewOutboundConnectionID: QUICConnectionID?
+    public var lastNewOutboundStatelessResetToken: QUICStatelessResetToken?
+    public var lastRetiredOutboundConnectionID: QUICConnectionID?
+    public var lastRetiredOutboundStatelessResetToken: QUICStatelessResetToken?
+    #endif
     public func handleNetworkProtocolEvent(_ from: ProtocolInstanceReference, event: NetworkProtocolEvent) {
         log.debug("Received network protocol event: \(event)")
         #if !NETWORK_NO_SWIFT_QUIC
         if let quicEvent = event.quicEvent {
             switch quicEvent {
             case .newInboundConnectionID: newInboundCIDEventCount += 1
-            case .newOutboundConnectionID: newOutboundCIDEventCount += 1
+            case .newOutboundConnectionID(let connectionID, let statelessResetToken):
+                newOutboundCIDEventCount += 1
+                lastNewOutboundConnectionID = connectionID
+                lastNewOutboundStatelessResetToken = statelessResetToken
+            case .retiredOutboundConnectionID(let connectionID, let statelessResetToken):
+                retiredOutboundCIDEventCount += 1
+                lastRetiredOutboundConnectionID = connectionID
+                lastRetiredOutboundStatelessResetToken = statelessResetToken
+            case .pathChanged(let info):
+                if let completion = completions.pathChanged {
+                    completion(info)
+                }
+            case .pathValidated(let info):
+                if let completion = completions.pathValidated {
+                    completion(info)
+                }
+            case .pathUnreachable(let info):
+                if let completion = completions.pathUnreachable {
+                    completion(info)
+                }
             default: break
             }
         }

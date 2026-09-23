@@ -41,6 +41,7 @@ public enum SerializationResult: CustomStringConvertible, Equatable, Sendable {
     case success(writtenBytes: Int, remainingBytes: Int)
     case error(SerializationError)
 
+    @usableFromInline
     static let success: Self = .success(writtenBytes: 0, remainingBytes: 0)
 
     public var description: String {
@@ -51,7 +52,9 @@ public enum SerializationResult: CustomStringConvertible, Equatable, Sendable {
         }
     }
 
-    var isValid: Bool {
+    @inlinable
+    @inline(always)
+    public var isValid: Bool {
         if case .error = self { return false }
         return true
     }
@@ -356,14 +359,20 @@ public struct SerializeCounter {
 @_spi(ProtocolProvider)
 @available(Network 0.1.0, *)
 public struct InPlaceSerializer<Factory: SerializerSpanFactory & ~Copyable & ~Escapable>: ~Escapable, ~Copyable {
-    private var factory: Factory
-    private var currentSpan: MutableRawSpan
-    private var currentSpanByteCount = 0
-    private var availableByteCount: Int
-    private var scratchSpace = [16 of UInt8](repeating: 0)
-    private var cursor = 0
-    private var previousSpanAggregateByteCount = 0
-    private var internalResult: SerializationResult = .success
+    @usableFromInline
+    var factory: Factory
+    @usableFromInline
+    var currentSpan: MutableRawSpan
+    @usableFromInline
+    var availableByteCount: Int
+    @usableFromInline
+    var scratchSpace: [16 of UInt8]?  // Initialized lazily
+    @usableFromInline
+    var cursor = 0
+    @usableFromInline
+    var previousSpanAggregateByteCount = 0
+    @usableFromInline
+    var internalResult: SerializationResult = .success
 
     /// Extracts the factory from the serializer, consuming the serializer in the process.
     @_lifetime(copy self)
@@ -371,6 +380,8 @@ public struct InPlaceSerializer<Factory: SerializerSpanFactory & ~Copyable & ~Es
         factory
     }
 
+    @inline(always)
+    @inlinable
     @_lifetime(copy factory)
     init(_ factory: consuming Factory) {
         self.availableByteCount = factory.availableByteCount
@@ -379,29 +390,42 @@ public struct InPlaceSerializer<Factory: SerializerSpanFactory & ~Copyable & ~Es
         self.refill()
     }
 
+    // Simple initializer for single span case with empty span factory
+    @usableFromInline
+    @_lifetime(copy span)
+    init(_ span: consuming MutableRawSpan) where Factory == EmptySpanFactory {
+        self.availableByteCount = span.byteCount
+        self.currentSpan = span
+        self.factory = EmptySpanFactory()
+    }
+
     /// Refills the serializer with the next span from the factory, and resets the cursor and internal result so serialization can continue.
     ///
     /// - Returns: A Boolean value that indicates whether the factory had another span available; returns `false` when no more spans remain.
     @discardableResult
+    @inline(always)
+    @inlinable
     mutating func refill() -> Bool {
         guard let span = factory.nextMutableSpan() else {
             return false
         }
-        previousSpanAggregateByteCount += cursor
+        previousSpanAggregateByteCount &+= cursor
         currentSpan = span
         cursor = 0
-        currentSpanByteCount = currentSpan.byteCount
         return true
     }
-    private var totalBytesWritten: Int {
-        previousSpanAggregateByteCount + cursor
+    @usableFromInline
+    var totalBytesWritten: Int {
+        previousSpanAggregateByteCount &+ cursor
     }
+    @inline(always)
+    @inlinable
     var finalResult: SerializationResult {
         switch internalResult {
         case .success:
             let totalRemaining: Int
             if availableByteCount >= totalBytesWritten {
-                totalRemaining = availableByteCount - totalBytesWritten
+                totalRemaining = availableByteCount &- totalBytesWritten
             } else {
                 totalRemaining = remaining
                 precondition(remaining >= 0)
@@ -410,31 +434,50 @@ public struct InPlaceSerializer<Factory: SerializerSpanFactory & ~Copyable & ~Es
         case .error: return internalResult
         }
     }
-    private var remaining: Int {
+    @inlinable
+    @inline(always)
+    var remaining: Int {
         #if DEBUG
-        precondition(currentSpanByteCount >= cursor)
+        precondition(currentSpan.byteCount >= cursor)
         #endif
-        return currentSpanByteCount - cursor
+        return currentSpan.byteCount &- cursor
     }
-    private func hasRoom(_ length: Int) -> Bool {
+    @inlinable
+    @inline(always)
+    func hasRoom(_ length: Int) -> Bool {
         internalResult.isValid && remaining >= length
     }
-    private mutating func invalidate(_ error: SerializationError) throws(SerializationError) -> Never {
+    @inlinable
+    @inline(always)
+    mutating func invalidate(_ error: SerializationError) throws(SerializationError) -> Never {
         internalResult = .error(error)
         throw error
     }
 
-    private mutating func moveCursor(_ amount: Int) throws(SerializationError) {
+    @inlinable
+    @inline(always)
+    mutating func moveCursorUnchecked(_ amount: Int) {
+        // It is safe to always add the amount to the cursor, since the length
+        // was already checked. So, we use &+= which skips the more expensive
+        // overflow check.
+        cursor &+= amount
+    }
+
+    @inlinable
+    @inline(always)
+    mutating func moveCursor(_ amount: Int) throws(SerializationError) {
         guard amount <= remaining else {
             try invalidate(.bufferTooShort)
         }
-        cursor &+= amount
+        moveCursorUnchecked(amount)
     }
 
     /// Writes a fixed-size value, choosing the fast or fragmented path.
     ///
     /// Uses the fast path when the current span has enough room, or falls back to `writeFragmented(_:)`.
-    private mutating func writeFixedSize<T: BitwiseCopyable>(_ value: T) throws(SerializationError) {
+    @inlinable
+    @inline(always)
+    mutating func writeFixedSize<T: BitwiseCopyable>(_ value: T) throws(SerializationError) {
         let length = MemoryLayout<T>.size
         guard hasRoom(length) else {
             try writeFragmented(value)
@@ -442,17 +485,23 @@ public struct InPlaceSerializer<Factory: SerializerSpanFactory & ~Copyable & ~Es
         }
 
         currentSpan.storeBytes(of: value, toByteOffset: cursor, as: T.self)
-        try moveCursor(length)
+        moveCursorUnchecked(length)
     }
 
     /// Writes a fixed-size value across span boundaries.
-    private mutating func writeFragmented<T: BitwiseCopyable>(_ value: T) throws(SerializationError) {
+    @inlinable
+    @inline(always)
+    mutating func writeFragmented<T: BitwiseCopyable>(_ value: T) throws(SerializationError) {
         let length = MemoryLayout<T>.size
         precondition(length <= 16)
+        if scratchSpace == nil {
+            // Lazy initialize on first use
+            scratchSpace = .init(repeating: 0)
+        }
         // Copy value bytes into scratch space
         withUnsafeBytes(of: value) { src in
             for i in 0..<length {
-                scratchSpace[i] = src[i]
+                scratchSpace![i] = src[i]
             }
         }
         // Write from scratch space across spans
@@ -461,7 +510,7 @@ public struct InPlaceSerializer<Factory: SerializerSpanFactory & ~Copyable & ~Es
             let available = min(remaining, length - written)
             if available > 0 {
                 for i in 0..<available {
-                    currentSpan.storeBytes(of: scratchSpace[written + i], toByteOffset: cursor + i, as: UInt8.self)
+                    currentSpan.storeBytes(of: scratchSpace![written &+ i], toByteOffset: cursor &+ i, as: UInt8.self)
                 }
                 try moveCursor(available)
                 written += available
@@ -474,46 +523,68 @@ public struct InPlaceSerializer<Factory: SerializerSpanFactory & ~Copyable & ~Es
         }
     }
 
+    @inlinable
+    @inline(always)
     mutating public func uint8(_ value: UInt8) throws(SerializationError) {
         try writeFixedSize(value)
     }
 
+    @inlinable
+    @inline(always)
     public mutating func uint16(_ value: UInt16) throws(SerializationError) {
         try writeFixedSize(value)
     }
 
+    @inlinable
+    @inline(always)
     public mutating func int16(_ value: Int16) throws(SerializationError) {
         try writeFixedSize(value)
     }
 
+    @inlinable
+    @inline(always)
     public mutating func uint32(_ value: UInt32) throws(SerializationError) {
         try writeFixedSize(value)
     }
 
+    @inlinable
+    @inline(always)
     public mutating func int32(_ value: Int32) throws(SerializationError) {
         try writeFixedSize(value)
     }
 
+    @inlinable
+    @inline(always)
     public mutating func uint64(_ value: UInt64) throws(SerializationError) {
         try writeFixedSize(value)
     }
 
+    @inlinable
+    @inline(always)
     public mutating func uint16NetworkByteOrder(_ value: UInt16) throws(SerializationError) {
         try writeFixedSize(value.bigEndian)
     }
 
+    @inlinable
+    @inline(always)
     public mutating func uint32NetworkByteOrder(_ value: UInt32) throws(SerializationError) {
         try writeFixedSize(value.bigEndian)
     }
 
+    @inlinable
+    @inline(always)
     public mutating func uint64NetworkByteOrder(_ value: UInt64) throws(SerializationError) {
         try writeFixedSize(value.bigEndian)
     }
 
+    @inlinable
+    @inline(always)
     public mutating func vle<T: FixedWidthInteger>(_ value: T) throws(SerializationError) {
         try self.vle(UInt64(value))
     }
 
+    @inlinable
+    @inline(always)
     public mutating func vle(_ value: UInt64) throws(SerializationError) {
         var encodedValue = [1 of UInt64](repeating: 0)
         var encodedValueSpan = encodedValue.mutableSpan
@@ -533,10 +604,14 @@ public struct InPlaceSerializer<Factory: SerializerSpanFactory & ~Copyable & ~Es
         try span(encodedValueBytes.bytes.extracting(first: length))
     }
 
+    @inlinable
+    @inline(always)
     public mutating func uuid(_ value: SystemUUID) throws(SerializationError) {
         try writeFixedSize(value)
     }
 
+    @inlinable
+    @inline(always)
     mutating public func fixedLengthUTF8(_ value: String, byteCount: Int) throws(SerializationError) {
         guard byteCount > 0 else {
             return
@@ -565,57 +640,81 @@ public struct InPlaceSerializer<Factory: SerializerSpanFactory & ~Copyable & ~Es
         }
     }
 
+    @inlinable
+    @inline(always)
     mutating public func string(_ value: String) throws(SerializationError) {
         let utf8 = value.utf8
         try uint16(UInt16(utf8.count))
         try fixedLengthUTF8(value, byteCount: utf8.count)
     }
 
+    @_optimize(speed)
+    @inlinable
+    @inline(always)
     public mutating func span(_ source: RawSpan) throws(SerializationError) {
         let length = source.byteCount
         guard length > 0 else {
             return
         }
 
-        var written = 0
-        while written < length {
-            let available = min(remaining, length - written)
-            if available > 0 {
-                source.withUnsafeBytes { srcBuffer in
-                    currentSpan.withUnsafeMutableBytes { dstBuffer in
-                        let dst = UnsafeMutableRawBufferPointer(
-                            start: dstBuffer.baseAddress! + cursor,
-                            count: available
-                        )
-                        let src = UnsafeRawBufferPointer(
-                            start: srcBuffer.baseAddress! + written,
-                            count: available
-                        )
-                        dst.copyMemory(from: src)
+        guard hasRoom(length) else {
+            // Fragmented path: the write straddles a span boundary, so copy
+            // in chunks, refilling from the factory as each span is exhausted.
+            var written = 0
+            while written < length {
+                let available = min(remaining, length &- written)
+                if available > 0 {
+                    source.withUnsafeBytes { srcBuffer in
+                        currentSpan.withUnsafeMutableBytes { dstBuffer in
+                            let dst = UnsafeMutableRawBufferPointer(
+                                start: dstBuffer.baseAddress! + cursor,
+                                count: available
+                            )
+                            let src = UnsafeRawBufferPointer(
+                                start: srcBuffer.baseAddress! + written,
+                                count: available
+                            )
+                            dst.copyMemory(from: src)
+                        }
+                    }
+                    try moveCursor(available)
+                    written &+= available
+                }
+                if written < length {
+                    guard refill() else {
+                        try invalidate(.bufferTooShort)
                     }
                 }
-                try moveCursor(available)
-                written += available
             }
-            if written < length {
-                guard refill() else {
-                    try invalidate(.bufferTooShort)
-                }
+            return
+        }
+        // Fast path, only a single span
+        var sourceSpan = currentSpan._mutatingExtracting(unchecked: cursor..<(cursor &+ length))
+        source.withUnsafeBytes { srcBuffer in
+            sourceSpan.withUnsafeMutableBytes { dstBuffer in
+                dstBuffer.copyMemory(from: srcBuffer)
             }
         }
+        moveCursorUnchecked(length)
     }
 
+    @inlinable
+    @inline(always)
     public mutating func buffer(_ value: [UInt8]) throws(SerializationError) {
         try span(value.span.bytes)
     }
 
     #if !NETWORK_EMBEDDED && canImport(Foundation)
+    @inlinable
+    @inline(always)
     public mutating func buffer(_ value: any DataProtocol) throws(SerializationError) {
         let array = [UInt8](value)
         try span(array.span.bytes)
     }
     #endif
 
+    @inlinable
+    @inline(always)
     public mutating func skip(_ length: Int) throws(SerializationError) {
         try moveCursor(length)
     }
@@ -837,6 +936,8 @@ public struct FrameSerializer: ~Copyable {
 @available(Network 0.1.0, *)
 extension Serializer {
 
+    @inline(always)
+    @inlinable
     public static func serialize<T: SerializerSpanFactory & ~Copyable & ~Escapable>(
         _ factory: consuming T,
         _ builder: (_ buffer: inout InPlaceSerializer<T>) throws(SerializationError) -> Void
@@ -865,22 +966,32 @@ extension Serializer {
         return result
     }
 
+    @inline(always)
+    @inlinable
     public static func serialize(
         _ span: consuming MutableSpan<UInt8>,
-        _ builder: (_ buffer: inout InPlaceSerializer<SingleMutableSpanFactory>) throws(SerializationError) -> Void
+        _ builder: (_ buffer: inout InPlaceSerializer<EmptySpanFactory>) throws(SerializationError) -> Void
     ) -> SerializationResult {
-        serialize(SingleMutableSpanFactory(span), builder)
+        var serializer = InPlaceSerializer<EmptySpanFactory>(span.mutableBytes)
+        do {
+            try builder(&serializer)
+        } catch {
+            // Error already recorded in internalResult via invalidate
+        }
+        return serializer.finalResult
     }
 
+    @inline(always)
+    @inlinable
     public static func serialize(
         _ frame: inout Frame,
         claim: Bool,
-        _ builder: (_ serializer: inout InPlaceSerializer<SingleMutableSpanFactory>) throws(SerializationError) -> Void
+        _ builder: (_ serializer: inout InPlaceSerializer<EmptySpanFactory>) throws(SerializationError) -> Void
     ) -> SerializationResult {
 
         var result: SerializationResult = .success
         if let mutableBytes = frame.mutableSpan {
-            result = serialize(SingleMutableSpanFactory(mutableBytes), builder)
+            result = serialize(mutableBytes, builder)
         }
         if claim, case .success(let writtenBytes, _) = result {
             guard frame.claim(fromStart: writtenBytes) else {

@@ -170,15 +170,12 @@ struct ECN: ~Copyable, PrefixedLoggable {
 
     static func processIPCodpoint(
         ecn: borrowing ECN,
-        path: QUICPath?,
+        path: QUICPath,
         stats: inout Statistics,
         packetNumberSpace: PacketNumberSpace,
         flag: IPProtocol.ECN
     ) -> Bool {
-        guard let path else {
-            return false
-        }
-        return path.ecnState?.processIPCodepoint(
+        path.ecnState?.processIPCodepoint(
             ecn: ecn,
             stats: &stats,
             packetNumberSpace: packetNumberSpace,
@@ -186,18 +183,17 @@ struct ECN: ~Copyable, PrefixedLoggable {
         ) ?? false
     }
 
+    @inline(always)
     static func outgoingIPCodepoint(
         ecn: borrowing ECN,
-        path: QUICPath?,
+        path: QUICPath,
         stats: inout Statistics,
         packet: inout SentPacketRecord
     ) -> IPProtocol.ECN {
-        guard let path else {
-            return .nonECT
-        }
-        return path.ecnState?.outgoingIPCodepoint(ecn: ecn, stats: &stats, packet: &packet)
+        path.ecnState?.outgoingIPCodepoint(ecn: ecn, stats: &stats, packet: &packet)
             ?? .nonECT
     }
+
 }
 
 // Per path explicit congestion notification state
@@ -326,13 +322,12 @@ struct ECNPathState: ~Copyable, PrefixedLoggable {
     // Returns count of CE feedback received in the QUIC header
     mutating func validateAck(
         ecn: borrowing ECN,
-        frame: FrameAck,
+        frame: borrowing FrameAck,
         previousLargestAcked: PacketNumber,
         newlyAckedECNPackets: UInt64
     ) -> Int {
-        let ackFrame = frame
-        let largestAcked = ackFrame.largest
-        let packetNumberSpace = ackFrame.packetNumberSpace
+        let largestAcked = frame.largest
+        let packetNumberSpace = frame.packetNumberSpace
         let counters = ecnCounters(ecn: ecn, packetNumberSpace: packetNumberSpace)
 
         // An endpoint MUST NOT fail ECN validation as a result of processing an ACK frame that
@@ -348,14 +343,14 @@ struct ECNPathState: ~Copyable, PrefixedLoggable {
         if state.shouldNotUseECN {
             return 0
         }
-        if ackFrame.ecnCounter == nil, newlyAckedECNPackets > 0 {
+        if frame.ecnCounter == nil, newlyAckedECNPackets > 0 {
             log.info(
                 "ECN validation failed due to receiving an ACK without ECN even though we sent \(newlyAckedECNPackets) ECT packets"
             )
             fsmChange(state: .unsupported)
             return 0
         }
-        guard let ackFrameECNCounter = ackFrame.ecnCounter else {
+        guard let ackFrameECNCounter = frame.ecnCounter else {
             log.info(
                 "Receiving ACK frame without ECN counts is ok only if newly ACKed packets were not originally sent with ECT"
             )
@@ -449,6 +444,7 @@ struct ECNPathState: ~Copyable, PrefixedLoggable {
 
     // Returns the IP ECN flag that should be set on the outgoing packet
     // based on the state machine
+    @inline(always)
     mutating func outgoingIPCodepoint(
         ecn: borrowing ECN,
         stats: inout Statistics,

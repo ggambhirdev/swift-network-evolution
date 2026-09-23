@@ -116,11 +116,11 @@ public struct FrameArray: ~Copyable {
             case .stopIterating:
                 return
             case .removeFrameAndContinue:
-                frames.remove(at: index)
+                frames.fastRemove(at: index)
                 count -= 1
             // Don't increment index
             case .replaceWithFramesAndContinue(var newFrames):
-                frames.remove(at: index)
+                frames.fastRemove(at: index)
                 count -= 1
                 let insertCount = newFrames.count
                 var insertIndex = index
@@ -141,6 +141,13 @@ public struct FrameArray: ~Copyable {
                 return
             }
         }
+    }
+
+    public mutating func drainArrayKeepingCapacity() -> FrameArray {
+        let count = self.count
+        let returnArray = self
+        self = FrameArray(capacity: count)
+        return returnArray
     }
 
     public mutating func drainArray(maximumFrameCount: Int? = nil) -> FrameArray {
@@ -277,5 +284,18 @@ public struct FrameArray: ~Copyable {
             return true
         }
         return connectionComplete
+    }
+}
+
+@_spi(ProtocolProvider)
+@available(Network 0.1.0, *)
+extension NetworkUniqueDeque where Element: ~Copyable {
+    @discardableResult
+    @inline(always)
+    mutating func fastRemove(at index: Int) -> Element {
+        if index == 0 {
+            return removeFirst()
+        }
+        return remove(at: index)
     }
 }

@@ -141,6 +141,8 @@ public final class QUICPath: MultiplexingDatagramPath<QUICConnection>, Equatable
     private(set) var state: QUICPathState = QUICPathState()
     var priority: Int = 0  // Relative priority to other paths, used to gate migration decisions
     var interface: Interface?
+    var localEndpoint: Endpoint?
+    var remoteEndpoint: Endpoint?
 
     private(set) var dcid: QUICConnectionID?  // The DCID we assigned before probing
     private(set) var scid: QUICConnectionID?  // Contains the SCID we expect to see once we migrate.
@@ -363,7 +365,7 @@ public final class QUICPath: MultiplexingDatagramPath<QUICConnection>, Equatable
         )
     }
 
-    func updateBDP(length: Int, now: NetworkClock.Instant = NetworkClock.Instant.now) {
+    func updateBDP(length: Int, now: NetworkClock.Instant) {
         if bdp.timestamp == .zero {
             bdp.timestamp = now
         }
@@ -571,6 +573,20 @@ public final class QUICPath: MultiplexingDatagramPath<QUICConnection>, Equatable
                     )
                 }
             }
+            if let localEndpoint, let remoteEndpoint,
+                case .address(let localAddress) = localEndpoint.type,
+                case .address(let remoteAddress) = remoteEndpoint.type
+            {
+                let pathInfo = QUICPathInfo(
+                    isValidated: self.isValidated,
+                    remote: remoteAddress,
+                    local: localAddress
+                )
+                parentProtocol.deliverNetworkProtocolEvent(
+                    flow: .allFlows,
+                    event: .init(quicEvent: .pathUnreachable(pathInfo))
+                )
+            }
             return
         }
 
@@ -585,7 +601,7 @@ public final class QUICPath: MultiplexingDatagramPath<QUICConnection>, Equatable
         }
         challengesSent += 1
 
-        parentProtocol.migration.resetTimer(connection: parentProtocol)
+        parentProtocol.migration.resetTimer(now: now, connection: parentProtocol)
     }
 
     func addPendingItems(_ pendingItems: inout PendingItems, now: NetworkClock.Instant, ) {
@@ -610,7 +626,7 @@ public final class QUICPath: MultiplexingDatagramPath<QUICConnection>, Equatable
             return
         }
         log.debug("Valid path challenge response received: \(data)")
-        let now = NetworkClock.Instant.now
+        let now = parentProtocol.now
         let responseDuration = pendingOutboundChallenge.sentTime.duration(to: now)
         pendingOutboundChallenges.removeAll()
         challengesSent = 0
@@ -618,7 +634,22 @@ public final class QUICPath: MultiplexingDatagramPath<QUICConnection>, Equatable
         changeState(to: .validated)
         // Initialize RTT based on the PATH_RESPONSE duration so that we have a proper RTT estimate when we reset the timers.
         rtt.processNewSample(ackDuration: responseDuration, packetAckedTime: now, ackDelay: .zero)
-        parentProtocol.migration.resetTimer(connection: parentProtocol)
+        parentProtocol.migration.resetTimer(now: now, connection: parentProtocol)
+        // Notify the stack about the path becoming validated
+        if let localEndpoint, let remoteEndpoint,
+            case .address(let localAddress) = localEndpoint.type,
+            case .address(let remoteAddress) = remoteEndpoint.type
+        {
+            let pathInfo = QUICPathInfo(
+                isValidated: self.isValidated,
+                remote: remoteAddress,
+                local: localAddress
+            )
+            parentProtocol.deliverNetworkProtocolEvent(
+                flow: .allFlows,
+                event: .init(quicEvent: .pathValidated(pathInfo))
+            )
+        }
         if migrationPending {
             migrationPending = false
             parentProtocol.migration.migrate(to: self, connection: parentProtocol)
@@ -633,42 +664,49 @@ public final class QUICPath: MultiplexingDatagramPath<QUICConnection>, Equatable
 // Congestion Control access
 @available(Network 0.1.0, *)
 extension QUICPath {
-    @inline(__always)
+    @inline(always)
     var congestionControlWindow: UInt64 {
         congestionControl?.congestionWindow ?? 0
     }
 
-    @inline(__always)
+    @inline(always)
     var congestionControlAvailableCongestionWindow: UInt64 {
         congestionControl?.availableCongestionWindow ?? 0
     }
 
-    @inline(__always)
+    @inline(always)
     func congestionControlCanSend(packetLength: Int) -> Bool {
         congestionControl?.canSend(packetLength: packetLength) ?? false
     }
 
-    @inline(__always)
+    @inline(always)
     func congestionControlPersistentCongestion(mss: Int, qlog: QLog? = nil) {
         congestionControl?.persistentCongestion(mss: mss, qlog: qlog)
     }
 
-    @inline(__always)
+    @inline(always)
     func congestionControlAckEnd(rtt: borrowing RTT, path: QUICPath?, mss: Int, packetsLost: Bool, qlog: QLog? = nil) {
-        congestionControl?.ackEnd(rtt: rtt, path: self, mss: mss, packetsLost: packetsLost, qlog: qlog)
+        congestionControl?.ackEnd(
+            rtt: rtt,
+            path: self,
+            mss: mss,
+            packetsLost: packetsLost,
+            now: parentProtocol.now,
+            qlog: qlog
+        )
     }
 
-    @inline(__always)
+    @inline(always)
     func congestionControlPacketsSent(bytesSent: Int, qlog: QLog? = nil) {
         congestionControl?.packetSent(bytesSent: bytesSent, qlog: qlog)
     }
 
-    @inline(__always)
+    @inline(always)
     func congestionControlPacketsAcked(bytesAcked: Int, sentTime: NetworkClock.Instant) {
         congestionControl?.packetsAcked(bytesAcked: bytesAcked, sentTime: sentTime)
     }
 
-    @inline(__always)
+    @inline(always)
     func congestionControlPacketsLost(
         bytesLost: Int,
         largestLostSentTime: NetworkClock.Instant,
@@ -679,46 +717,47 @@ extension QUICPath {
             bytesLost: bytesLost,
             largestLostSentTime: largestLostSentTime,
             mss: mss,
-            smoothedRTT: smoothedRTT
+            smoothedRTT: smoothedRTT,
+            now: parentProtocol.now
         ) ?? false
     }
 
-    @inline(__always)
+    @inline(always)
     func congestionControlPacketDiscarded(bytesSent: Int, qlog: QLog? = nil) {
         congestionControl?.packetDiscarded(bytesSent: bytesSent, qlog: qlog)
     }
 
-    @inline(__always)
+    @inline(always)
     func congestionControlAckBegin() {
         congestionControl?.ackBegin()
     }
 
-    @inline(__always)
+    @inline(always)
     var congestionControlBytesInFlight: UInt64 {
         congestionControl?.bytesInFlight ?? 0
     }
 
-    @inline(__always)
+    @inline(always)
     var congestionControlName: String {
         congestionControl?.name ?? "none"
     }
 
-    @inline(__always)
+    @inline(always)
     func congestionControlSpuriousRetransmit(qlog: QLog? = nil) {
         congestionControl?.spuriousRetransmit()
     }
 
-    @inline(__always)
+    @inline(always)
     func congestionControlMSSChanged(mss: Int) {
         congestionControl?.mssChanged(mss: mss)
     }
 
-    @inline(__always)
+    @inline(always)
     func congestionControlIdleTimeout(mss: Int) {
         congestionControl?.idleTimeout(mss: mss)
     }
 
-    @inline(__always)
+    @inline(always)
     func congestionControlProcessECN(
         ceCount: Int,
         packetsAcked: Int,
@@ -740,6 +779,7 @@ extension QUICPath {
                 largestAckedSentTime: largestAckedSentTime,
                 mss: mss,
                 smoothedRTT: smoothedRTT,
+                now: parentProtocol.now,
                 qlog: qlog
             )
         #if !NETWORK_EMBEDDED
@@ -752,6 +792,7 @@ extension QUICPath {
                 largestAckedSentTime: largestAckedSentTime,
                 mss: mss,
                 smoothedRTT: smoothedRTT,
+                now: parentProtocol.now,
                 qlog: qlog
             )
         case .prague(var prague):
@@ -763,13 +804,14 @@ extension QUICPath {
                 largestAckedSentTime: largestAckedSentTime,
                 mss: mss,
                 smoothedRTT: smoothedRTT,
+                now: parentProtocol.now,
                 qlog: qlog
             )
         #endif
         }
     }
 
-    @inline(__always)
+    @inline(always)
     func congestionControlFilloutDataTransferSnapshot(snapshot: inout DataTransferSnapshot) {
         congestionControl?.filloutDataTransferSnapshot(dataTransferSnapshot: &snapshot)
     }

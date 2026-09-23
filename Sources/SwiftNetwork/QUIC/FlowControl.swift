@@ -376,7 +376,7 @@ struct FlowControlStreamState: ~Copyable {
 extension QUICStreamInstance {
 
     // Offset in the stream from which to next send bytes
-    @inline(__always)
+    @inline(always)
     var sendOffset: UInt64 {
         flowControlState.totalOutboundBytesSent
     }
@@ -398,6 +398,14 @@ extension QUICStreamInstance {
         flowControlState.totalOutboundBytesSent += bytes
         connection.flowControlState.pendingOutboundBytesToSend -= bytes
         connection.flowControlState.totalOutboundBytesSent += bytes
+
+        // Draining can reopen a permit that transient backpressure latched to 0
+        if self.maximumStreamDataSize == 0 {
+            updateOutboundFlowControlCredit(connection: connection)
+            if self.maximumStreamDataSize > 0 {
+                upper.deliverOutboundRoomAvailableEvent(reference)
+            }
+        }
     }
 
     func removePendingOutboundBytesFromFlowControl(connection: QUICConnection) {
@@ -780,7 +788,7 @@ extension QUICStreamInstance {
                     shift = 1
                 }
                 log.datapath(
-                    "Estimated BDP \(receiveHighWaterMarkCount)B, current RTT \(rtt)us, estimated bandwidth 8 * \(receiveHighWaterMarkCount) / \(rtt) Mbps"
+                    "Estimated BDP \(receiveHighWaterMarkCount)B, current RTT \(rtt), estimated bandwidth 8 * \(receiveHighWaterMarkCount) / \(rtt.microseconds) Mbps"
                 )
 
                 let (incr, overflow) = (receiveHighWaterMarkCount << shift)

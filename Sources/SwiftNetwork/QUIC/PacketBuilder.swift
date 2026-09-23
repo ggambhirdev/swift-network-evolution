@@ -49,6 +49,7 @@ enum PacketBuilderError: Int, Error {
 
 @available(Network 0.1.0, *)
 extension Packet {
+    @inline(always)
     static func build(
         into outboundFrame: inout Frame,
         number: PacketNumber,
@@ -62,7 +63,9 @@ extension Packet {
         availableCongestionWindow: UInt64,
         token: [UInt8]?,
         stats: inout Statistics,
-        version: QUICVersion
+        version: QUICVersion,
+        isServer: Bool,
+        testSendingShortPackets: Bool
     ) throws(QUICError) -> Packet {
         let longHeader = Packet.requiresLongHeader(keyState: keyState)
         guard let dcid = path.dcid else {
@@ -109,7 +112,7 @@ extension Packet {
         let lengthBeforeWritingHeader = outboundFrame.unclaimedLength
 
         var headerVersion: UInt32 = version.rawValue
-        if !connection.isServer, connection.forceUnsupportedClientVersion, keyState == .initial {
+        if !isServer, connection.forceUnsupportedClientVersion, keyState == .initial {
             // For testing support only (should only run once per test connection)
             headerVersion = QUICVersion.unsupportedVersion
             connection.forceUnsupportedClientVersion = false
@@ -159,7 +162,7 @@ extension Packet {
                 availableCongestionWindow: remainingCongestionWindow,
                 isAckEliciting: &isAckEliciting,
                 isInFlightEligible: &isInFlightEligible,
-                maximumFrameCount: connection.testSendingShortPackets && packet.longHeader ? 1 : nil,
+                maximumFrameCount: testSendingShortPackets && packet.longHeader ? 1 : nil,
                 shorthandFrames: &shorthandFrames
             )
         } catch {

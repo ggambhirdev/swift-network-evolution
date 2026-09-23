@@ -44,6 +44,17 @@ public struct EmptySpanFactory: ~Escapable, DeserializerSpanFactory {
     }
 }
 
+// `EmptySpanFactory` also serves as the placeholder factory for `InPlaceSerializer`
+// when it is constructed directly from a single span, bypassing Span factories for the fast path.
+@_spi(ProtocolProvider)
+@available(Network 0.1.0, *)
+extension EmptySpanFactory: SerializerSpanFactory {
+    @_lifetime(&self)
+    public mutating func nextMutableSpan() -> MutableRawSpan? {
+        nil
+    }
+}
+
 // MARK: - SerializerSpanFactory
 
 @_spi(ProtocolProvider)
@@ -63,9 +74,12 @@ public protocol SerializerSpanFactory: ~Copyable, ~Escapable {
 @_spi(ProtocolProvider)
 @available(Network 0.1.0, *)
 public struct SingleMutableSpanFactory: ~Copyable, ~Escapable, SerializerSpanFactory {
-    private var span: MutableSpan<UInt8>
+    @usableFromInline
+    var span: MutableSpan<UInt8>
     private var consumed: Bool = false
 
+    @inline(always)
+    @inlinable
     @_lifetime(copy span)
     init(_ span: consuming MutableSpan<UInt8>) {
         self.span = span

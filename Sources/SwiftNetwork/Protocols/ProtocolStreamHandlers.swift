@@ -62,6 +62,20 @@ extension AutomaticLowerStreamProcessing where Self: ~Copyable {
         lowerSendQueue.add(frames: streamData)
     }
 
+    public mutating func addToLowerSendQueue(_ streamData: consuming Frame) {
+        lowerSendQueue.add(frame: streamData)
+    }
+
+    /// Enqueues a single outbound frame of stream data to be sent to the lower protocol.
+    public mutating func enqueueOutboundFrame(_ frame: consuming Frame) {
+        addToLowerSendQueue(frame)
+    }
+
+    /// Enqueues a batch of outbound stream data to be sent to the lower protocol.
+    public mutating func enqueueOutboundFrameArray(_ frameArray: consuming FrameArray) throws(NetworkError) {
+        try addToLowerSendQueue(frameArray)
+    }
+
     /// Indicates to the lower protocol that stream data has been added to the send queue.
     ///
     /// Drains `lowerSendQueue` to the lower protocol.
@@ -126,6 +140,20 @@ extension AutomaticUpperStreamProcessing where Self: ~Copyable {
     /// Appends frames to `upperReceiveQueue`.
     public mutating func addToUpperReceiveQueue(_ streamData: consuming FrameArray) throws(NetworkError) {
         upperReceiveQueue.add(frames: streamData)
+    }
+
+    public mutating func addToUpperReceiveQueue(_ streamData: consuming Frame) {
+        upperReceiveQueue.add(frame: streamData)
+    }
+
+    /// Enqueues a single inbound frame of stream data to be delivered to the upper protocol.
+    public mutating func enqueueOutboundFrame(_ frame: consuming Frame) {
+        addToUpperReceiveQueue(frame)
+    }
+
+    /// Enqueues a batch of inbound stream data to be delivered to the upper protocol.
+    public mutating func enqueueOutboundFrameArray(_ frameArray: consuming FrameArray) throws(NetworkError) {
+        try addToUpperReceiveQueue(frameArray)
     }
 
     /// Indicates to the upper protocol that stream data has been added to the receive queue.
@@ -314,6 +342,8 @@ extension ProtocolInstanceReference {
                     try instance.receiveStreamData(from, minimumBytes: minimumBytes, maximumBytes: maximumBytes)
                 }
             #endif
+            case .customLink(var instance):
+                return try instance.receiveStreamData(from, minimumBytes: minimumBytes, maximumBytes: maximumBytes)
             default: fatalError("Protocol cannot accept receiveStreamData call")
             }
         }
@@ -339,6 +369,7 @@ extension ProtocolInstanceReference {
                     try instance.getOutboundStreamDataRoomAvailable(from)
                 }
             #endif
+            case .customLink(var instance): return try instance.getOutboundStreamDataRoomAvailable(from)
             default: fatalError("Protocol cannot accept getOutboundStreamDataRoomAvailable call")
             }
         }
@@ -372,6 +403,7 @@ extension ProtocolInstanceReference {
                     try instance.sendStreamData(from, streamData: streamData)
                 }
             #endif
+            case .customLink(var instance): try instance.sendStreamData(from, streamData: streamData)
             default: fatalError("Protocol cannot accept sendStreamData call")
             }
         }
@@ -400,7 +432,10 @@ extension ProtocolInstanceReference {
                 }
             #endif
             // Sending early stream data not supported on the protocol
-            default: throw NetworkError.posix(ENOTSUP)
+            default:
+                var streamData = streamData
+                streamData.finalizeAllFramesAsFailed()
+                throw NetworkError.posix(ENOTSUP)
             }
         }
     }
