@@ -354,9 +354,17 @@ final class RecoveryTests: XCTestCase {
                 ranges: [FrameAckRange(gap: 0, range: 0)]
             )
             self.connection.recovery.receivedAck(ack: ack, ackedPath: self.path, connection: self.connection)
-            self.connection.recovery.findLostPacket(pnSpace: .applicationData, connection: self.connection)
+            self.connection.recovery.findLostPacket(
+                pnSpace: .applicationData,
+                timeNow: self.connection.now,
+                connection: self.connection
+            )
             XCTAssertEqual(self.connection.stats[.txLostPackets], 1)
-            self.connection.recovery.findLostPacket(pnSpace: .applicationData, connection: self.connection)
+            self.connection.recovery.findLostPacket(
+                pnSpace: .applicationData,
+                timeNow: self.connection.now,
+                connection: self.connection
+            )
             XCTAssertEqual(self.connection.stats[.txLostPackets], 1)
             self.connection.recovery.withImmutableInnerState(packetNumberSpace: .applicationData) { state in
                 // Retransmission removes the original record; a late ACK must not

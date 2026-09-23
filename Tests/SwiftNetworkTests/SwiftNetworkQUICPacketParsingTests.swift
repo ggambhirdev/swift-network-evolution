@@ -107,6 +107,21 @@ final class SwiftNetworkQUICPacketParsingTests: NetTestCase {
         Logger.test.info(
             "Server connection state after malformed Initial: \(server.instance.state)"
         )
+        let metricsExpectation = XCTestExpectation(description: "Validate rejected datagram accounting")
+        harness.context.async {
+            defer { metricsExpectation.fulfill() }
+            guard
+                case .dataTransferSnapshot(let snapshot) = server.instance.getMetrics(
+                    flow: .allFlows,
+                    requestedNetworkMetric: .dataTransferSnapshot
+                )
+            else {
+                return XCTFail("Missing transfer snapshot")
+            }
+            // Receive accounting counts datagram frames, including this malformed input.
+            XCTAssertEqual(snapshot.receivedTransportDatagramCount, 1)
+        }
+        wait(for: [metricsExpectation], timeout: 5.0)
     }
 
     func testMalformedShortHeaderAfterHandshake() throws {
