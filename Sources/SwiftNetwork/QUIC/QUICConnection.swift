@@ -2500,6 +2500,9 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
     #endif
 
     public func updateDataTransferSnapshot(flow: MultiplexedFlowIdentifier, _ snapshot: inout DataTransferSnapshot) {
+        snapshot.receivedTransportPacketCount = UInt64(clamping: self.stats[.rxPackets])
+        snapshot.sentTransportPacketAttemptCount = UInt64(clamping: self.stats[.txPackets])
+        snapshot.lostTransportPacketCount = UInt64(clamping: self.stats[.txLostPackets])
         snapshot.receivedTransportOutOfOrderByteCount = UInt64(clamping: self.stats[.rxOutOfOrderBytes])
         snapshot.sentTransportRetransmittedByteCount = UInt64(clamping: self.stats[.txRetransmittedBytes])
         snapshot.sentTransportECNCapablePacketCount = UInt64(clamping: self.stats[.ecnCapablePacketsSent])

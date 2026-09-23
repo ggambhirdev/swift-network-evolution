@@ -66,6 +66,21 @@ final class SwiftNetworkQUICStatisticsTests: NetTestCase {
                     let second = state.serverInstance
                     // Seed independent connection storage on its context. This tests
                     // ownership and snapshot copies, not packet accounting.
+                    let firstPackets = (first.stats[.rxPackets], first.stats[.txPackets], first.stats[.txLostPackets])
+                    let secondPackets = (
+                        second.stats[.rxPackets], second.stats[.txPackets], second.stats[.txLostPackets]
+                    )
+                    defer {
+                        (first.stats[.rxPackets], first.stats[.txPackets], first.stats[.txLostPackets]) = firstPackets
+                        (second.stats[.rxPackets], second.stats[.txPackets], second.stats[.txLostPackets]) =
+                            secondPackets
+                    }
+                    first.stats[.rxPackets] = 11
+                    first.stats[.txPackets] = 22
+                    first.stats[.txLostPackets] = 3
+                    second.stats[.rxPackets] = 44
+                    second.stats[.txPackets] = 55
+                    second.stats[.txLostPackets] = 6
                     let firstSaved = first.stats[.ecnCapablePacketsSent]
                     let secondSaved = second.stats[.ecnCapablePacketsSent]
                     defer {
@@ -87,6 +102,9 @@ final class SwiftNetworkQUICStatisticsTests: NetTestCase {
                         XCTFail("Missing snapshots")
                         return
                     }
+                    first.stats[.rxPackets] = 77
+                    first.stats[.txPackets] = 88
+                    first.stats[.txLostPackets] = 9
                     first.stats[.ecnCapablePacketsSent] = 43
                     guard
                         case .dataTransferSnapshot(let firstAfter) = first.getMetrics(
@@ -105,6 +123,24 @@ final class SwiftNetworkQUICStatisticsTests: NetTestCase {
                     XCTAssertEqual(firstAfter.sentTransportECNCapablePacketCount, 43)
                     XCTAssertEqual(secondBefore.sentTransportECNCapablePacketCount, 31)
                     XCTAssertEqual(secondAfter, secondBefore)
+                    XCTAssertEqual(firstBefore.receivedTransportPacketCount, 11)
+                    XCTAssertEqual(firstBefore.sentTransportPacketAttemptCount, 22)
+                    XCTAssertEqual(firstBefore.lostTransportPacketCount, 3)
+                    XCTAssertEqual(firstAfter.receivedTransportPacketCount, 77)
+                    XCTAssertEqual(firstAfter.sentTransportPacketAttemptCount, 88)
+                    XCTAssertEqual(firstAfter.lostTransportPacketCount, 9)
+                    XCTAssertEqual(secondBefore.receivedTransportPacketCount, 44)
+                    XCTAssertEqual(secondBefore.sentTransportPacketAttemptCount, 55)
+                    XCTAssertEqual(secondBefore.lostTransportPacketCount, 6)
+                    // Replacing the current path must not replace connection statistics.
+                    let savedPath = first.currentPath
+                    defer { first.currentPath = savedPath }
+                    first.currentPath = QUICPath(parent: first)
+                    var replaced = DataTransferSnapshot()
+                    first.updateDataTransferSnapshot(flow: .allFlows, &replaced)
+                    XCTAssertEqual(replaced.receivedTransportPacketCount, firstAfter.receivedTransportPacketCount)
+                    XCTAssertEqual(replaced.sentTransportPacketAttemptCount, firstAfter.sentTransportPacketAttemptCount)
+                    XCTAssertEqual(replaced.lostTransportPacketCount, firstAfter.lostTransportPacketCount)
                 }
                 self.wait(for: [expectation], timeout: 5.0)
             }
@@ -128,6 +164,20 @@ final class SwiftNetworkQUICStatisticsTests: NetTestCase {
                         XCTFail("Established QUIC connection has no path or transfer snapshot")
                         return
                     }
+                    XCTAssertEqual(
+                        snapshot.receivedTransportPacketCount,
+                        UInt64(state.clientInstance.stats[.rxPackets])
+                    )
+                    XCTAssertEqual(
+                        snapshot.sentTransportPacketAttemptCount,
+                        UInt64(state.clientInstance.stats[.txPackets])
+                    )
+                    XCTAssertEqual(
+                        snapshot.lostTransportPacketCount,
+                        UInt64(state.clientInstance.stats[.txLostPackets])
+                    )
+                    XCTAssertGreaterThan(snapshot.receivedTransportPacketCount, 0)
+                    XCTAssertGreaterThan(snapshot.sentTransportPacketAttemptCount, 0)
                     XCTAssertTrue(path.rtt.hasInitialMeasurement)
                     XCTAssertEqual(snapshot.transportCurrentRTT, path.rtt.adjustedRTT)
                     XCTAssertEqual(snapshot.transportMinimumRTT, path.rtt.minRTT)

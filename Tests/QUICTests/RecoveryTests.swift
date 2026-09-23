@@ -334,6 +334,50 @@ final class RecoveryTests: XCTestCase {
         }
     }
 
+    func testPacketLossCountSurvivesRepeatedDetectionAndLateAck() {
+        let done = XCTestExpectation(description: "Validate cumulative loss accounting")
+        connection.context.async {
+            defer { done.fulfill() }
+            for number: Int64 in [0, 4] {
+                var packet = SentPacketRecord()
+                packet.identifier = .init(space: .applicationData, number: PacketNumber(number))
+                packet.isInFlightEligible = true
+                packet.isAckEliciting = true
+                packet.totalLength = 1000
+                packet.sentPath = self.path.identifier
+                self.sentPacket(packet, connection: self.connection)
+            }
+            let ack = FrameAck(
+                packetNumberSpace: .applicationData,
+                largest: 4,
+                delay: 0,
+                ranges: [FrameAckRange(gap: 0, range: 0)]
+            )
+            self.connection.recovery.receivedAck(ack: ack, ackedPath: self.path, connection: self.connection)
+            self.connection.recovery.findLostPacket(pnSpace: .applicationData, connection: self.connection)
+            XCTAssertEqual(self.connection.stats[.txLostPackets], 1)
+            self.connection.recovery.findLostPacket(pnSpace: .applicationData, connection: self.connection)
+            XCTAssertEqual(self.connection.stats[.txLostPackets], 1)
+            self.connection.recovery.withImmutableInnerState(packetNumberSpace: .applicationData) { state in
+                // Retransmission removes the original record; a late ACK must not
+                // undo the historical loss declaration.
+                XCTAssertNil(state.indexOfPacketNumber(0))
+            }
+            let late = FrameAck(
+                packetNumberSpace: .applicationData,
+                largest: 0,
+                delay: 0,
+                ranges: [FrameAckRange(gap: 0, range: 0)]
+            )
+            self.connection.recovery.receivedAck(ack: late, ackedPath: self.path, connection: self.connection)
+            self.connection.recovery.withImmutableInnerState(packetNumberSpace: .applicationData) { state in
+                XCTAssertNil(state.indexOfPacketNumber(0))
+            }
+            XCTAssertEqual(self.connection.stats[.txLostPackets], 1)
+        }
+        wait(for: [done], timeout: 5.0)
+    }
+
     func testPacketAcked() {
         let ackFrame = FrameAck(
             packetNumberSpace: .applicationData,

@@ -23,6 +23,15 @@ public struct DataTransferSnapshot: Equatable {
     var receivedIPCEPacketCount: UInt64 = 0
     var sentIPPacketCount: UInt64 = 0
 
+    /// QUIC packets reaching the connection's receive accounting point.
+    /// This includes handshake traffic, but does not guarantee successful frame processing.
+    public internal(set) var receivedTransportPacketCount: UInt64 = 0
+    /// QUIC packet send attempts counted before sealing and lower-layer submission.
+    /// A later failure can prevent a counted attempt from being transmitted.
+    public internal(set) var sentTransportPacketAttemptCount: UInt64 = 0
+    /// QUIC packets declared lost, including declarations later found to be spurious.
+    public internal(set) var lostTransportPacketCount: UInt64 = 0
+
     var receivedTransportByteCount: UInt64 = 0
     var receivedTransportDuplicateByteCount: UInt64 = 0
     var receivedTransportOutOfOrderByteCount: UInt64 = 0

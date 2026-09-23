@@ -146,6 +146,46 @@ final class SwiftNetworkQUICECNTests: NetTestCase {
         )
     }
 
+    func testPacketLossSnapshotWithECNDisabled() throws {
+        let clientOptions = QUICProtocol.options()
+        clientOptions.connectionOptions.disableECN = true
+        clientOptions.connectionOptions.disableECNEcho = true
+        let serverOptions = QUICProtocol.options()
+        serverOptions.connectionOptions.disableECN = true
+        serverOptions.connectionOptions.disableECNEcho = true
+        QUICTestHarness().runQUICTest(
+            blockSize: 10240,
+            blockCount: 4,
+            clientDrops: .init([0...0, 20...21]),
+            clientOptions: clientOptions,
+            serverOptions: serverOptions,
+            afterData: { harness in
+                let expectation = XCTestExpectation(description: "Validate packet loss without ECN")
+                harness.context.async {
+                    defer { expectation.fulfill() }
+                    guard let connection = harness.state?.clientInstance,
+                        case .dataTransferSnapshot(let snapshot) = connection.getMetrics(
+                            flow: .allFlows,
+                            requestedNetworkMetric: .dataTransferSnapshot
+                        )
+                    else {
+                        XCTFail("Missing QUIC connection or snapshot")
+                        return
+                    }
+                    XCTAssertGreaterThan(connection.stats[.txLostPackets], 0)
+                    XCTAssertEqual(snapshot.lostTransportPacketCount, UInt64(connection.stats[.txLostPackets]))
+                    XCTAssertGreaterThan(snapshot.lostTransportPacketCount, 0)
+                    XCTAssertEqual(snapshot.sentTransportECNCapablePacketCount, 0)
+                    XCTAssertEqual(snapshot.sentTransportECNCapableAckedPacketCount, 0)
+                    XCTAssertEqual(snapshot.sentTransportECNCapableMarkedPacketCount, 0)
+                    XCTAssertEqual(snapshot.sentTransportECNCapableLostPacketCount, 0)
+                    self.assertECNSnapshotMatchesStatistics(connection)
+                }
+                self.wait(for: [expectation], timeout: 5.0)
+            }
+        )
+    }
+
     func testQUICTestECNMarkedPacketsSentAndACKed() throws {
         QUICTestHarness().runQUICTest(
             dataBlock: Array("Hello World!".utf8),
