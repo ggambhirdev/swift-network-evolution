@@ -252,19 +252,44 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
     var maxKeepaliveCount = 0
     var unackedKeepaliveCount = 0
 
-    var currentInboundReceiveTimestamp: NetworkClock.Instant?
-    var currentSendTimestamp: NetworkClock.Instant?
+    /// A continuous and an absolute reading of the clock, taken back to back.
+    struct ClockSample {
+        let continuous: NetworkClock.Instant
+        let absolute: NetworkClock.Instant
+    }
+
+    /// The readings pinned by `withPinnedClock`, or `nil` outside it.
+    ///
+    /// `Pacer` converts between the two clock domains by subtracting one reading from the other, so
+    /// the pair must be sampled together. Pinning also keeps `getSendTime` from reading either clock.
+    var pinnedClock: ClockSample?
 
     @_optimize(speed)
     @inline(always)
     var now: NetworkClock.Instant {
-        if let currentInboundReceiveTimestamp {
-            return currentInboundReceiveTimestamp
-        } else if let currentSendTimestamp {
-            return currentSendTimestamp
-        } else {
-            return NetworkClock.Instant.now
+        pinnedClock?.continuous ?? context.now
+    }
+
+    @_optimize(speed)
+    @inline(always)
+    var nowAbsolute: NetworkClock.Instant {
+        pinnedClock?.absolute ?? context.nowAbsolute
+    }
+
+    /// Runs `body` with the clock pinned, so everything inside it sees one pair of readings.
+    ///
+    /// The outermost call takes the pin and releases it on the way out. One nested inside
+    /// another keeps the outer call's readings, so `now` holds still for the whole batch.
+    /// Code that needs real elapsed time within a batch reads `context.now` directly.
+    @inline(always)
+    func withPinnedClock(_ body: () -> Void) {
+        if pinnedClock != nil {
+            body()
+            return
         }
+        pinnedClock = ClockSample(continuous: context.now, absolute: context.nowAbsolute)
+        defer { pinnedClock = nil }
+        body()
     }
 
     var lastPacketReceivedTimestamp: NetworkClock.Instant = .zero
@@ -361,6 +386,18 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
     private(set) var migrationSupported = false
 
     private var pendOutboundData = false  // Don't immediately process application sends
+
+    // Set while `recovery` is exclusively borrowed for ACK processing.
+    //
+    // Acknowledging a packet can close a stream (a fully-ACKed RESET_STREAM or
+    // FIN), and closing a stream wants to flush frames. The no-argument
+    // `sendFrames()` passes `&recovery` inout, so doing that from inside the ACK
+    // walk would be a second overlapping modification of `recovery` and traps
+    // under exclusivity enforcement. While this is set, `sendFrames()` records
+    // the request instead of performing it, and the ACK path flushes once the
+    // borrow ends.
+    private var isProcessingAcks = false
+    private var deferredSendFramesRequested = false
 
     // false == IPv6, true == IPv4
     private(set) var initialAddressIsIPv4 = false
@@ -526,6 +563,14 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
             pmtudIgnoreCost = protocolOptions.quicConnectionOptions.pmtudIgnoreCost
             pmtudInterval = protocolOptions.quicConnectionOptions.pmtudUpdateInterval
 
+            // RFC 9000 - 14.1. Initial Datagram Size
+            // Datagrams containing Initial packets MAY exceed 1200 bytes if the sender
+            // believes that the network path and peer both support the size that it chooses
+            let requestedInitialPacketSize = Int(protocolOptions.quicConnectionOptions.initialPacketSize)
+            if requestedInitialPacketSize > Constants.initialMSS {
+                initialMSS = requestedInitialPacketSize
+            }
+
             pacingEnabled = protocolOptions.quicConnectionOptions.enablePacing
 
             testSendingShortPackets =
@@ -592,8 +637,8 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
         }
         // Only setup qlog if the directory is set
         if let qlogConfiguration {
-            self.qLog = QLog(configuration: qlogConfiguration)
-            log.info("qlog setup with configuration: \(qlogConfiguration)")
+            self.qLog = QLog(configuration: qlogConfiguration, context: context)
+            log.info("QLog setup with configuration: \(qlogConfiguration)")
         }
         #endif
         log.info("Setup QUIC connection (spin bit \(spinBitEnabled ? "enabled" : "disabled"))")
@@ -1562,61 +1607,61 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
     public func serviceReceivedDatagrams(path pathID: MultiplexingPathIdentifier) {
         let inboundInterval = QUICSignpost.inboundStarting(id: signpostID)
 
-        // Save a timestamp to avoid calculating `now` again during processing
-        currentInboundReceiveTimestamp = .now
+        // Pin the clock so the whole batch is timed against one value rather than reading the
+        // clock again per datagram
+        withPinnedClock {
+            // Start anew with pendingItems for applicationPendingItems
+            // Detect if any received packet contains a QUIC Frame that unblocks
+            // all streams, such as a new MAX_DATA. Includes setting
+            // triggerAllStreamsUnblocked = false
+            applicationPendingItems.triggerAllStreamsUnblocked = false
 
-        // Start anew with pendingItems for applicationPendingItems
-        // Detect if any received packet contains a QUIC Frame that unblocks
-        // all streams, such as a new MAX_DATA. Includes setting
-        // triggerAllStreamsUnblocked = false
-        applicationPendingItems.triggerAllStreamsUnblocked = false
-
-        // Tell recovery that a batch of packets is starting to be processed; suppress timer updates.
-        // Ending recovery is deferred until servicing is done.
-        recovery.startBatch()
-        defer {
-            recovery.endBatch(connection: self)
-            currentInboundReceiveTimestamp = nil
-        }
-
-        if !pendingReassemblyDequeue.isEmpty {
-            log.fault("Pending Reassembly Dequeue is not empty")
-        }
-
-        accessReceivedDatagrams(path: pathID) { (datagrams, path) in
-            let connectionState = state
-            let isServerConnection: Bool = isServer
-            if connectionState.isTerminal {
-                log.debug(
-                    "Ignoring incoming packets for connection in terminal state"
-                )
-                datagrams.finalizeAllFramesAsFailed()
-                return
+            // Tell recovery that a batch of packets is starting to be processed; suppress timer updates.
+            // Ending recovery is deferred until servicing is done.
+            recovery.startBatch()
+            defer {
+                recovery.endBatch(connection: self)
             }
-            let inConnectedState = connectionState == .connected
-            var receivedBytes: Int = 0
-            let receivedPackets: Int = datagrams.count
-            datagrams.iterateMutableFrames { frame in
-                receivedBytes &+= frame.unclaimedLength
-                handleInbound(
-                    frame: &frame,
-                    from: path,
-                    inConnectedState: inConnectedState,
-                    isServerConnection: isServerConnection
-                )
-                return .removeFrameAndContinue
-            }
-            stats.increment(.rxPackets, by: receivedPackets)
-            stats.increment(.rxBytes, by: receivedBytes)
-            path.pathStatistics.increment(.rxPackets, by: receivedPackets)
-            path.pathStatistics.increment(.rxBytes, by: receivedBytes)
-        }
 
-        // Note: inboundStopping() triggers any sendFrames*() as necessary due
-        // to this external event
-        QUICSignpost.inboundStopping(inboundInterval)
-        inboundStopping(path: pathID)
-        checkConnectionIdle(unackedPacketCount: self.ack.unackedPacketCount)
+            if !pendingReassemblyDequeue.isEmpty {
+                log.fault("Pending Reassembly Dequeue is not empty")
+            }
+
+            accessReceivedDatagrams(path: pathID) { (datagrams, path) in
+                let connectionState = state
+                let isServerConnection: Bool = isServer
+                if connectionState.isTerminal {
+                    log.debug(
+                        "Ignoring incoming packets for connection in terminal state"
+                    )
+                    datagrams.finalizeAllFramesAsFailed()
+                    return
+                }
+                let inConnectedState = connectionState == .connected
+                var receivedBytes: Int = 0
+                let receivedPackets: Int = datagrams.count
+                datagrams.iterateMutableFrames { frame in
+                    receivedBytes &+= frame.unclaimedLength
+                    handleInbound(
+                        frame: &frame,
+                        from: path,
+                        inConnectedState: inConnectedState,
+                        isServerConnection: isServerConnection
+                    )
+                    return .removeFrameAndContinue
+                }
+                stats.increment(.rxPackets, by: receivedPackets)
+                stats.increment(.rxBytes, by: receivedBytes)
+                path.pathStatistics.increment(.rxPackets, by: receivedPackets)
+                path.pathStatistics.increment(.rxBytes, by: receivedBytes)
+            }
+
+            // Note: inboundStopping() triggers any sendFrames*() as necessary due
+            // to this external event
+            QUICSignpost.inboundStopping(inboundInterval)
+            inboundStopping(path: pathID)
+            checkConnectionIdle(unackedPacketCount: self.ack.unackedPacketCount)
+        }
     }
 
     func handleInbound(
@@ -1712,7 +1757,15 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
                 break
             }
 
-            if closeError != nil {
+            if closeError != nil || state.isTerminal {
+                // Besides a locally-detected error (closeError), the peer may
+                // have gracefully closed the connection (CONNECTION_CLOSE
+                // with NO_ERROR, or an APPLICATION_CLOSE frame, neither of
+                // which set closeError) while processing this packet's
+                // frames. Either way, `close()` has already torn down crypto
+                // and other per-connection state (see closeTLSFlow()), so we
+                // must not hand any further coalesced packets in this
+                // datagram to that torn-down state.
                 frame.finalize(success: false)
                 close()
                 return
@@ -1809,6 +1862,7 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
                             .protocolViolation,
                         "Client sent initial packet with invalid QUIC frames"
                     )
+                    QUICFrame.discard(quicFrame)
                     return false
                 }
             }
@@ -1831,8 +1885,20 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
                 log.error("Invalid frame type during the handshake: \(quicFrame.frameType)")
                 closeFrameType = quicFrame.frameType
                 close(with: .protocolViolation, "invalid frame type during the handshake")
+                QUICFrame.discard(quicFrame)
+                return false
             }
             if !processFrame(quicFrame, packetNumberSpace: packet.numberSpace, path: path) {
+                break
+            }
+            if state.isTerminal {
+                // Some frame handlers (e.g. CONNECTION_CLOSE, APPLICATION_CLOSE)
+                // call close() - which tears down crypto and other per-connection
+                // state - but still report success (return true) for the frame
+                // itself. Stop processing any further frames from this packet
+                // once that happens, rather than continuing to hand already
+                // torn-down state to later frames (e.g. a coalesced CRYPTO
+                // frame after a CONNECTION_CLOSE).
                 break
             }
         }
@@ -1932,10 +1998,14 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
         // Resetting congestion control will reset the pacer too
         currentPath.resetCongestionControl()
         log.info("Retransmitting INITIAL with version \(version.rawValue)")
+        guard let tlsOptions else {
+            log.error("Failed to start TLS: missing TLS options")
+            return
+        }
         // Resetting crypto here will guarantee the initial is sent again
         crypto.stop()
         crypto = QUICCrypto(context: context)
-        guard let tlsOptions, crypto.start(with: self, tlsOptions: tlsOptions) else {
+        guard crypto.start(with: self, tlsOptions: tlsOptions) else {
             log.error("Failed to start TLS")
             return
         }
@@ -2026,10 +2096,14 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
         protector.deriveInitialSecrets(destinationCID: scid)
 
         log.info("Retransmitting INITIAL with token len: \(packet.tokenLength)")
+        guard let tlsOptions else {
+            log.error("Failed to start TLS: missing TLS options")
+            return
+        }
         // Resetting crypto here will guarantee the initial is sent again
         crypto.stop()
         crypto = QUICCrypto(context: context)
-        guard let tlsOptions, crypto.start(with: self, tlsOptions: tlsOptions) else {
+        guard crypto.start(with: self, tlsOptions: tlsOptions) else {
             log.error("Failed to start TLS")
             return
         }
@@ -2422,62 +2496,64 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
 
         let outboundInterval = QUICSignpost.outboundStarting(id: signpostID)
 
-        // Save a timestamp to avoid calculating `now` again during processing
-        currentSendTimestamp = .now
-        defer {
-            // Always reset
-            QUICSignpost.outboundStopping(outboundInterval)
-            currentSendTimestamp = nil
-        }
-
-        accessStreamDataToSend(flow: flowID) { streamData in
-            while var frame = streamData.popFirst() {
-
-                // If the connection is complete, it is always a FIN
-                let dataLength = frame.unclaimedLength
-                let connectionComplete = frame.connectionComplete
-                let metadataComplete = frame.metadataComplete
-                var isFinal = connectionComplete
-
-                // If the metadata is connection mode (so each metadata is a new stream)
-                // and the metadata is complete, this is also a FIN
-
-                if frame.protocolMetadatas.count > 0 {
-                    if frame.protocolMetadatas[0].metadata.matches(
-                        protocolIdentifier: QUICConnectionProtocol.identifier
-                    ) {
-                        isFinal = isFinal || metadataComplete
-                    }
-                }
-                log.datapath(
-                    "Handle outbound stream data for [\(streamID)] (size \(dataLength) metadataComplete: \(metadataComplete), connectionComplete: \(connectionComplete), isFinal: \(isFinal))"
-                )
-
-                if dataLength > 0 {
-                    processOutbound(frame: frame, flowID: flowID, stream: stream, isLast: isFinal)
-                    continue
-                } else if isFinal, let _ = knownFlows[streamID] {
-                    log.datapath("Treating zero length fin as a stop message")
-                    disconnect(flow: flowID, direction: .outbound)
-                } else {
-                    // For QUIC, empty frames with just metadata are not meaningful if they are not complete
-                    log.notice("Not processing outbound data of length 0")
-                }
-                frame.finalize(success: false)
+        // Pin the clock so the whole batch is timed against one value rather than reading the
+        // clock again per packet
+        withPinnedClock {
+            defer {
+                QUICSignpost.outboundStopping(outboundInterval)
             }
-        }
 
-        if !stream.sendState.dataHasAlreadyBeenSent {
-            applicationPendingItems.appendStreamToService(stream)
-        }
-        // Note: trigger sending of any frames based on this external event
-        checkConnectionIdle(unackedPacketCount: self.ack.unackedPacketCount)
+            accessStreamDataToSend(stream: stream) { streamData in
+                while var frame = streamData.popFirst() {
 
-        guard !pendOutboundData else {
-            log.datapath("Outbound data pended, ignore send frames")
-            return
+                    // If the connection is complete, it is always a FIN
+                    let dataLength = frame.unclaimedLength
+                    let connectionComplete = frame.connectionComplete
+                    let metadataComplete = frame.metadataComplete
+                    var isFinal = connectionComplete
+
+                    // If the metadata is connection mode (so each metadata is a new stream)
+                    // and the metadata is complete, this is also a FIN
+
+                    if frame.protocolMetadatas.count > 0 {
+                        if frame.protocolMetadatas[0].metadata.matches(
+                            protocolIdentifier: QUICConnectionProtocol.identifier
+                        ) {
+                            isFinal = isFinal || metadataComplete
+                        }
+                    }
+                    #if DatapathLogging
+                    log.datapath(
+                        "Handle outbound stream data for [\(streamID)] (size \(dataLength) metadataComplete: \(metadataComplete), connectionComplete: \(connectionComplete), isFinal: \(isFinal))"
+                    )
+                    #endif
+
+                    if dataLength > 0 {
+                        processOutbound(frame: frame, flowID: flowID, stream: stream, isLast: isFinal)
+                        continue
+                    } else if isFinal, let _ = knownFlows[streamID] {
+                        log.datapath("Treating zero length fin as a stop message")
+                        disconnect(flow: flowID, direction: .outbound)
+                    } else {
+                        // For QUIC, empty frames with just metadata are not meaningful if they are not complete
+                        log.notice("Not processing outbound data of length 0")
+                    }
+                    frame.finalize(success: false)
+                }
+            }
+
+            if !stream.sendState.dataHasAlreadyBeenSent {
+                applicationPendingItems.appendStreamToService(stream)
+            }
+            // Note: trigger sending of any frames based on this external event
+            checkConnectionIdle(unackedPacketCount: self.ack.unackedPacketCount)
+
+            guard !pendOutboundData else {
+                log.datapath("Outbound data pended, ignore send frames")
+                return
+            }
+            sendFrames()
         }
-        sendFrames()
     }
 
     #if !NETWORK_EMBEDDED
@@ -2989,7 +3065,9 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
     func flushPendingItems() {
         initialPendingItems.flush()
         handshakePendingItems.flush()
-        applicationPendingItems.flush()
+        for flowID in applicationPendingItems.flushClearingQueuedStreams() {
+            clearStreamSendable(flowID)
+        }
     }
 
     // Indicates whether the asynchronous send continuation is running or not
@@ -3024,7 +3102,15 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
     // Adds recovery and applicationPendingItems to avoid extra begin/end acccess checking overhead
     @discardableResult
     func sendFrames(ignoreCongestionWindow: Bool = false, delayedACK: Bool = false) -> Bool {
-        sendFrames(
+        // ACK processing holds `recovery` exclusively, and acknowledging a packet
+        // can close a stream, which in turn wants to flush frames. Passing
+        // `&recovery` again here would overlap that borrow and trap, so record
+        // the request and let the ACK path flush once its borrow has ended.
+        if isProcessingAcks {
+            deferredSendFramesRequested = true
+            return false
+        }
+        return sendFrames(
             ignoreCongestionWindow: ignoreCongestionWindow,
             delayedACK: delayedACK,
             sentPackets: &sentPackets,
@@ -3342,10 +3428,12 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
             } else if packetBurst >= Constants.packetBurstCount {
                 // The packet burst count has been reached, check the time
                 //
-                // Deliberately the live clock rather than `self.now`: under a batch `self.now` is
+                // Deliberately the context's clock rather than `self.now`: under a batch `self.now` is
                 // pinned, and `startSendingTimestamp` came from it, so comparing the two would
                 // always give zero and the cap could never be reached.
-                if startSendingTimestamp.duration(to: .now) >= Constants.maxPacketBurstDuration {
+                if startSendingTimestamp.duration(to: context.now)
+                    >= Constants.maxPacketBurstDuration
+                {
                     // The maximum burst time has been reached
                     shouldEndBurst = true
                 } else {
@@ -3362,7 +3450,7 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
             }
             // If we've exceeded the send burst limit, trigger an async before servicing more data
             if shouldEndBurst {
-                log.datapath("burst limit application data")
+                log.datapath("Burst limit application data")
                 applicationPendingItems.rotateFirstStreamToService()
                 burstLimitReached()
                 break
@@ -4107,6 +4195,12 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
                 localMaxStreamData: stream.flowControlState.inboundMaxData
             )
 
+            // The application has given up on reading, so any bytes still
+            // buffered are discarded here. Return the receive-window credit they
+            // consumed; the zombie's final-size handling covers only the bytes
+            // still in flight beyond what we have already received.
+            stream.discardUnreadInboundBytes(connection: self)
+
             // Do we delete this 'stream' somehow, now that it's a zombie?
             // Once it's got no more references it will automatically taken care of
             // with ARC. It may have references in pendingStartStreams (removed above)
@@ -4286,7 +4380,7 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
                 ))
         {
             log.datapath(
-                "reordering/loss detected (received: \(packet.number), largest ack-eliciting: \(largetACKElicitingPN), sending ACK"
+                "Reordering/loss detected (received: \(packet.number), largest ack-eliciting: \(largetACKElicitingPN), sending ACK"
             )
             stats.increment(.rxReorderedPackets)
             stats.increment(.rxReorderedBytes, by: Int(packet.totalLength))
@@ -4419,7 +4513,7 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
     func reportReady() {
         // Crypto should already have set this up using setRemoteTransportParameters()
         guard let remoteTransportParameters, !remoteTransportParametersForEarlyData else {
-            let error = "missing peer transport parameters"
+            let error = "Missing peer transport parameters"
             log.error(error)
             close(with: .transportParameterError, error)
             return
@@ -4543,6 +4637,13 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
             log.debug(
                 "Remote max datagram size \(remoteMaxDatagramFrameSize)"
             )
+            // A flow opened before the peer's transport parameters sized itself
+            // against a limit of 0, so recompute now that the limit is known.
+            if let path = currentPath {
+                applyToAllSecondaryFlows { datagramFlow in
+                    datagramFlow.updateUsableDatagramFrameSize(connection: self, path: path)
+                }
+            }
         }
         guard let remoteTPMaxDatagramFrameSize else {
             self.remoteMaxDatagramFrameSize = 0
@@ -4583,6 +4684,11 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
         ack.flush(for: space)
     }
 
+    // Removes sendable flag when the application state is flushed
+    private func clearStreamSendable(_ flowID: MultiplexedFlowIdentifier) {
+        flow(for: flowID)?.listMembership.remove(.sendable)
+    }
+
     private func discardKeys(
         keyState: PacketKeyState,
         pendingItems: inout PendingItems,
@@ -4597,7 +4703,13 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
     private func discardKeys(keyState: PacketKeyState, discardRecoveryState: Bool = true) {
         let space = PacketNumberSpace.fromKeyState(keyState: keyState)
         // Flush first so that we won't send out frames other than ACKs with older key
-        withPendingItems(for: space) { $0.flush() }
+        if space == .applicationData {
+            for flowID in applicationPendingItems.flushClearingQueuedStreams() {
+                clearStreamSendable(flowID)
+            }
+        } else {
+            withPendingItems(for: space) { $0.flush() }
+        }
         discardKeysInternal(keyState: keyState, space: space, discardRecoveryState: discardRecoveryState)
     }
 
@@ -4643,10 +4755,18 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
                 log.error("Error sending frames on stream close: \(error)")
             }
         }
+
+        // Anything the application did not read above is now unreachable: the
+        // flow is about to be torn down. Those bytes consumed connection receive
+        // window when they arrived, so hand that credit back before the buffers
+        // are dropped, otherwise the window shrinks for the rest of the
+        // connection's life.
+        stream.discardUnreadInboundBytes(connection: self)
+
         stream.closed = true
         deliverDisconnectedEvent(flow: flowID, error: error)
         knownFlows.removeValue(forKey: streamID)
-        log.datapath("closed stream \(streamID.value)")
+        log.datapath("Closed stream \(streamID.value)")
 
         if let streamID = stream.streamID {
             if streamID.isReceiveOnly(server: self.isServer) {
@@ -4836,7 +4956,7 @@ extension QUICConnection {
     // Process an incoming STREAM frame
     func processStreamFrame(_ frame: consuming FrameStreamReceived) -> Bool {
         log.datapath(
-            "received STREAM frame with id: \(frame.id), offset: \(frame.offset) data length: \(frame.length)"
+            "Received STREAM frame with id: \(frame.id), offset: \(frame.offset) data length: \(frame.length)"
         )
         guard let streamID = QUICStreamID(frame.id) else {
             log.error("Stream frame with invalid stream ID \(frame.id)")
@@ -4889,7 +5009,7 @@ extension QUICConnection {
             return stream.processIncomingStream(connection: self, frame: frame)
         } else {
             stream.log.datapath(
-                "unable to handle frame len \(frame.length) offset \(frame.offset) fin \(frame.isFinal) on stream"
+                "Unable to handle frame len \(frame.length) offset \(frame.offset) fin \(frame.isFinal) on stream"
             )
             frame.frame.finalize(success: true)
             return true
@@ -4943,9 +5063,9 @@ extension QUICConnection {
             return false
         }
 
-        log.datapath("connection has received more credit")
+        log.datapath("Connection has received more credit")
         if hasSentDataBlocked {
-            log.datapath("unblocked")
+            log.datapath("Unblocked")
             applicationPendingItems.triggerAllStreamsUnblocked = true
             hasSentDataBlocked = false
         }
@@ -4954,7 +5074,7 @@ extension QUICConnection {
 
     // Handle incoming maxStreamData frame and update the remoteMaxStreamData if needed
     func processMaxStreamDataFrame(_ frame: consuming FrameMaxStreamData) -> Bool {
-        log.datapath("process MAX_STREAM_DATA")
+        log.datapath("Process MAX_STREAM_DATA")
 
         // 1. check streamID against the protocol streamID
         //    - if is recv only, close STREAM_STATE_ERROR
@@ -5030,7 +5150,7 @@ extension QUICConnection {
     // Handle incoming stream data blocked frame and notify application protocol if needed
     func processStreamDataBlocked(frame: consuming FrameStreamDataBlocked) -> Bool {
         guard let stream = streamFromStreamID(frame.id) else {
-            log.datapath("invalid streamID: \(frame.id)")
+            log.datapath("Invalid streamID: \(frame.id)")
             return false
         }
         guard !stream.streamID!.isSendOnly(server: isServer) else {
@@ -5198,6 +5318,11 @@ extension QUICConnection {
             return false
         }
 
+        // Acknowledging a packet can close a stream, and closing a stream wants
+        // to flush frames. Suppress those nested flushes for the duration of the
+        // `recovery` borrow below, then perform one flush afterwards if any were
+        // requested.
+        isProcessingAcks = true
         recovery.receivedAck(
             ack: frame,
             ackedPath: path,
@@ -5208,6 +5333,13 @@ extension QUICConnection {
         var sentPackets = NetworkUniqueDeque<SentPacketRecord>()
         path.pmtudState.tryToSend(on: path, sentPackets: &sentPackets)
         recovery.recordSentPackets(&sentPackets, connection: self)
+
+        // The borrow of `recovery` has ended, so it is safe to flush again.
+        isProcessingAcks = false
+        if deferredSendFramesRequested {
+            deferredSendFramesRequested = false
+            sendFrames()
+        }
         return true
     }
 
@@ -5216,6 +5348,7 @@ extension QUICConnection {
             self.applicationCloseError = QUICApplicationError(frame.errorCode, frame.reason)
             receivedApplicationClose = true
         }
+        log.info("Received APPLICATION_CLOSE code: \(frame.errorCode), reason: '\(frame.reason)'")
         close()
         return true
     }
@@ -5225,6 +5358,7 @@ extension QUICConnection {
             self.closeError = QUICTransportError(frame.errorCode, frame.reason)
             receivedConnectionClose = true
         }
+        log.info("Received CONNECTION_CLOSE code: \(frame.errorCode), reason: '\(frame.reason)'")
         close()
         return true
     }
@@ -5573,14 +5707,14 @@ extension QUICConnection {
             return
         }
         asyncSendRunning = true
-        log.datapath("async: scheduling restart after packet burst")
+        log.datapath("Async: scheduling restart after packet burst")
         self.async {
             self.resumeSendingAfterBurstLimit()
         }
     }
 
     fileprivate func resumeSendingAfterBurstLimit() {
-        log.datapath("async: resuming sending packets")
+        log.datapath("Async: resuming sending packets")
         asyncSendRunning = false
         sendFrames()
     }
@@ -5686,7 +5820,7 @@ extension QUICConnection {
             return (created: false, checkZombie: false)
         }
 
-        log.datapath("creating missing streams from \(streamID) to \(nextInboundStreamID)")
+        log.datapath("Creating missing streams from \(streamID) to \(nextInboundStreamID)")
 
         if self.streamIDBlocked(streamID: streamID) {
             log.error(
@@ -5788,7 +5922,7 @@ extension QUICConnection {
             return
         }
         if !sendFrames() {
-            log.datapath("failed to send DATAGRAM frames")
+            log.datapath("Failed to send DATAGRAM frames")
         }
     }
 
@@ -5823,18 +5957,18 @@ extension QUICConnection {
     func processDatagramFrame(_ frame: consuming FrameDatagram) -> Bool {
         if let datagramFlowID = frame.flowID, let contextID = frame.contextID {
             log.datapath(
-                "received DATAGRAM frame with length: \(frame.length), flow: \(datagramFlowID), context: \(contextID)"
+                "Received DATAGRAM frame with length: \(frame.length), flow: \(datagramFlowID), context: \(contextID)"
             )
         } else if let datagramFlowID = frame.flowID {
             log.datapath(
-                "received DATAGRAM frame with length: \(frame.length), flow: \(datagramFlowID)"
+                "Received DATAGRAM frame with length: \(frame.length), flow: \(datagramFlowID)"
             )
         } else if let contextID = frame.contextID {
             log.datapath(
-                "received DATAGRAM frame with length: \(frame.length), context: \(contextID)"
+                "Received DATAGRAM frame with length: \(frame.length), context: \(contextID)"
             )
         } else {
-            log.datapath("received DATAGRAM frame with length: \(frame.length)")
+            log.datapath("Received DATAGRAM frame with length: \(frame.length)")
         }
 
         var matchingFlowIdentifier = findSecondaryFlow(where: { candidateFlow in
@@ -5856,13 +5990,21 @@ extension QUICConnection {
                 logPrefixer: logPrefixer
             )
             multiplexedSecondaryFlows[newFlowIdentifier] = newFlow
-            deliverNewInboundSecondaryFlowEvent(newFlow.reference)
-
-            newFlow.log.debug("Created inbound datagram flow for \(newFlowIdentifier)")
 
             withCurrentPath { path in
                 newFlow.updateUsableDatagramFrameSize(connection: self, path: path)
             }
+            let datagramMetadata = QUICProtocol.metadata()
+            datagramMetadata.perProtocolMetadata?.datagramFlowID = newFlow.flowID
+            datagramMetadata.perProtocolMetadata?.isDatagramFlow = true
+            datagramMetadata.perProtocolMetadata?.usableDatagramFrameSize = UInt16(newFlow.usableDatagramSize)
+            datagramMetadata.perProtocolMetadata?.quicConnectionMetadata = self.connectionMetadata
+            secondaryInboundFlowLinkage.deliverNewInboundFlowEvent(
+                reference,
+                flowReference: newFlow.reference,
+                flowMetadata: datagramMetadata
+            )
+            newFlow.log.debug("Created inbound datagram flow for \(newFlowIdentifier)")
 
             matchingFlowIdentifier = newFlowIdentifier
         }
@@ -6132,6 +6274,13 @@ extension QUICConnection {
     }
 
     func checkConnectionIdle(unackedPacketCount: Int) {
+        // If no flow has ever been marked idle, `connectionIsIdleForAllStreams`
+        // can only return false, and since `path.reportedIdleEvent` is only
+        // ever set inside this function, no path can have it set either.
+        // The traversal below would be a guaranteed no-op, so skip it entirely.
+        guard flowsHaveEverMarkedIdle else {
+            return
+        }
         let isIdle = connectionIsIdleForAllStreams(unackedPacketCount: unackedPacketCount)
         applyToAllPaths { path in
             let pathIsIdle = isIdle && !path.isProbing && !path.shouldSendPathResponses

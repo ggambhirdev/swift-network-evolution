@@ -273,7 +273,7 @@ struct QUICStreamIDState: ~Copyable {
         let logContext = self.logContext
         let remoteMaxStreamID = self.remoteMaxStreamID
         Logger.proto.debug(
-            "\(logIDString) \(logContext) got newMaxStreams=\(newMaxStreams) which gives remoteMaxStreamID=\(remoteMaxStreamID?.description ?? "unknown")"
+            "\(logIDString) \(logContext) Got newMaxStreams=\(newMaxStreams) which gives remoteMaxStreamID=\(remoteMaxStreamID?.description ?? "unknown")"
         )
         #endif
     }
@@ -295,7 +295,7 @@ struct QUICStreamIDState: ~Copyable {
         let logContext = self.logContext
         let localMaxStreamID = self.localMaxStreamID
         Logger.proto.debug(
-            "\(logIDString) \(logContext) got newMaxStreams=\(newMaxStreams) which gives localMaxStreamID=\(localMaxStreamID?.description ?? "unknown")"
+            "\(logIDString) \(logContext) Got newMaxStreams=\(newMaxStreams) which gives localMaxStreamID=\(localMaxStreamID?.description ?? "unknown")"
         )
         #endif
     }
@@ -315,6 +315,7 @@ struct StreamListMembership: OptionSet {
         switch self {
         case .none: return "none"
         case .pendingReassemblyDequeue: return "pendingReassemblyDequeue"
+        case .sendable: return "sendable"
         case .unblockedSend: return "unblockedSend"
         default: return "none"
         }
@@ -651,7 +652,6 @@ public final class QUICStreamInstance: MultiplexedStreamFlow<QUICConnection>,
         connection: QUICConnection,
         frame: consuming FrameStreamReceived
     ) -> Bool {
-        log.datapath("processing")
         if self.pendingReportReady {
             self.flags.remove(.pendingReportReady)
         }
@@ -668,7 +668,7 @@ public final class QUICStreamInstance: MultiplexedStreamFlow<QUICConnection>,
         } else {
             frame.frame.finalize(success: false)
         }
-        log.datapath("received bytes up to \(self.flowControlState.totalInOrderInboundBytesRead)")
+        log.datapath("Received bytes up to \(self.flowControlState.totalInOrderInboundBytesRead)")
         return result
     }
 
@@ -832,7 +832,7 @@ public final class QUICStreamInstance: MultiplexedStreamFlow<QUICConnection>,
         // to the one already established
         if let finalSize, let newFinalSize, finalSize != newFinalSize {
             log.error(
-                "[true:\(self.receiveState)] endpoint received final size \(newFinalSize) different from already established \(finalSize)"
+                "[true:\(self.receiveState)] Endpoint received final size \(newFinalSize) different from already established \(finalSize)"
             )
             connection.close(
                 with:
@@ -844,13 +844,13 @@ public final class QUICStreamInstance: MultiplexedStreamFlow<QUICConnection>,
 
         if self.finalSize == nil, let newFinalSize {
             self.finalSize = newFinalSize
-            log.datapath("final size set to \(newFinalSize)")
+            log.datapath("Final size set to \(newFinalSize)")
         }
 
         let lastOffsetDelta = updateLastReceivedOffset(to: newLastOffset, connection: connection)
         if lastOffsetDelta != nil {
             log.datapath(
-                "[\(self.finalSize != nil ? "true" : "false"):\(self.receiveState)] adjusted last offset (conn \(connection.lastReceivedOffset), stream \(self.lastReceivedOffset))"
+                "[\(self.finalSize != nil ? "true" : "false"):\(self.receiveState)] Adjusted last offset (conn \(connection.lastReceivedOffset), stream \(self.lastReceivedOffset))"
             )
         }
 
@@ -875,10 +875,57 @@ public final class QUICStreamInstance: MultiplexedStreamFlow<QUICConnection>,
         self.sendInboundFlowControlCreditIfNeeded(connection: connection)
     }
 
+    // Discards every inbound byte still buffered for this stream and returns the
+    // flow control credit those bytes consumed.
+    //
+    // Called when the stream is closed with data the application never read,
+    // either still sitting in the reassembly queue or already dequeued into the
+    // upper receive queue awaiting a read. Those bytes counted against the
+    // connection's receive window when they arrived; without this the credit is
+    // never given back and the usable window shrinks permanently.
+    func discardUnreadInboundBytes(connection: QUICConnection) {
+        // Bytes handed to the upper layer but not yet read by the application.
+        // Dequeuing already advanced the reassembly queue's `currentOffset` past
+        // these, but flow control only counts them once the application reads,
+        // so they are still missing from the in-order total.
+        let pendingDelivery = UInt64(upperReceiveQueue.unclaimedLength)
+        // Contiguous bytes reassembled but not yet dequeued.
+        let pendingDequeue = UInt64(max(reassemblyQueue.availableToDequeue, 0))
+
+        // Anything the reassembly queue holds beyond the contiguous run is not
+        // yet part of the in-order total, so it has no credit to return here;
+        // the RESET_STREAM and zombie final-size paths cover those gaps.
+        let discardedBytes = pendingDelivery + pendingDequeue
+        guard discardedBytes > 0 else { return }
+
+        log.datapath(
+            "Discarding \(discardedBytes) unread inbound bytes on close "
+                + "(\(pendingDelivery) awaiting read, \(pendingDequeue) awaiting dequeue)"
+        )
+
+        // Release the frames themselves before crediting, so the buffers are
+        // freed even if the connection is already tearing down.
+        upperReceiveQueue.finalizeAllFramesAsFailed()
+
+        // Advance the in-order total to cover everything the queue holds
+        // contiguously, which is what the application could have read. This adds
+        // the same delta to the connection-wide total.
+        let newInOrderTotal = UInt64(reassemblyQueue.currentOffset) + pendingDequeue
+        reassemblyQueue.dequeueAll()
+        updateFlowControlWithTotalInOrderInboundBytesRead(
+            newInOrderTotal,
+            connection: connection
+        )
+
+        // Both components are now part of the in-order total, so credit them as
+        // consumed to move the MAX_DATA anchor past them.
+        connection.creditDiscardedInboundBytes(discardedBytes)
+    }
+
     @_optimize(speed)
     func dequeueReassembledData(connection: QUICConnection) -> FrameArray? {
         let totalLength = reassemblyQueue.availableToDequeue
-        log.datapath("total available reassembled data \(totalLength)")
+        log.datapath("Total available reassembled data \(totalLength)")
         guard totalLength >= 0 else {
             log.error("Reassembled data length cannot be negative")
             return nil
@@ -905,7 +952,7 @@ public final class QUICStreamInstance: MultiplexedStreamFlow<QUICConnection>,
 
             let itemLength = item.length
             writtenCount += itemLength
-            log.datapath("dequeued length \(itemLength)")
+            log.datapath("Dequeued length \(itemLength)")
 
             var frame = item.frame
 
@@ -1150,7 +1197,7 @@ extension QUICStreamInstance {
     }
 
     func processIncomingMaxStreamData(remoteMaxStreamData: UInt64) {
-        log.datapath("process MAX_STREAM_DATA")
+        log.datapath("Process MAX_STREAM_DATA")
 
         // Ignore MAX_STREAM_DATA when all stream data has been sent
         if sendState.dataHasAlreadyBeenSent {
@@ -1162,7 +1209,7 @@ extension QUICStreamInstance {
             return
         }
 
-        log.datapath("new maxStreamData \(remoteMaxStreamData), was \(previousRemoteMaxData)")
+        log.datapath("New maxStreamData \(remoteMaxStreamData), was \(previousRemoteMaxData)")
 
         guard flowControlState.outboundMaxData > self.sendOffset else {
             // If the new value is smaller, error. Otherwise just return since it didn't increase
@@ -1176,7 +1223,7 @@ extension QUICStreamInstance {
         }
 
         if hasSentDataBlocked {
-            log.datapath("unblocked")
+            log.datapath("Unblocked")
             hasSentDataBlocked = false
         }
     }

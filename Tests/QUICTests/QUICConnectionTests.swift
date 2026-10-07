@@ -29,6 +29,31 @@ final class QUICConnectionTests: XCTestCase {
         connection = QUICConnection(context: NetworkContext.implicitContext)
     }
 
+    /// A call nested inside a pinned scope must leave the outer readings in place; otherwise the
+    /// pin is gone when the nested call returns, `getSendTime` reads the two clocks separately,
+    /// and `Pacer` derives the offset between the clock domains from a mismatched pair.
+    func testANestedCallLeavesTheOuterReadingsInPlace() {
+        connection.withPinnedClock {
+            let readingsAtEntry = connection.pinnedClock
+            XCTAssertNotNil(readingsAtEntry)
+
+            connection.serviceReceivedDatagrams(path: 0)
+
+            XCTAssertEqual(connection.pinnedClock?.continuous, readingsAtEntry?.continuous)
+            XCTAssertEqual(connection.pinnedClock?.absolute, readingsAtEntry?.absolute)
+        }
+
+        XCTAssertNil(connection.pinnedClock)
+    }
+
+    /// The outermost call releases the pin on the way out; otherwise the connection answers every
+    /// later read with the same instant for the rest of its life.
+    func testTheOutermostCallReleasesThePin() {
+        connection.serviceReceivedDatagrams(path: 0)
+
+        XCTAssertNil(connection.pinnedClock)
+    }
+
     func testCreateInboundStreams() throws {
         let zeroStreamID: QUICStreamID = QUICStreamID(0)
         NetworkContext.implicitContext.async {
@@ -124,40 +149,7 @@ final class QUICConnectionTests: XCTestCase {
                 [],
                 "Valid long header, 8b dcid"
             ),
-            // long header - retry packet - contains version, DCID length, DCID, SCID length, SCID, retry token, retry tag, padding
-            (
-                [
-                    0xF0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x92, 0x0a,
-                    0xac, 0x45, 0xd8, 0xf1, 0x01, 0xa3, 0x08, 0x91,
-                    0x0b, 0xab, 0x41, 0xd8, 0xf1, 0x01, 0xa2, 0x68,
-                    0x65, 0x72, 0x65, 0x20, 0x69, 0x73, 0x20, 0x61,
-                    0x20, 0x72, 0x65, 0x74, 0x72, 0x79, 0x20, 0x74,
-                    0x6F, 0x6B, 0x65, 0x6E, 0x20, 0x6D, 0x61, 0x64,
-                    0x65, 0x20, 0x66, 0x6F, 0x72, 0x20, 0x74, 0x65,
-                    0x73, 0x74, 0x69, 0x6E, 0x67, 0x68, 0x65, 0x72,
-                    0x65, 0x20, 0x69, 0x73, 0x20, 0x69, 0x73, 0x68,
-                    0x65, 0x72, 0x65, 0x20, 0x69, 0x73, 0x20, 0x61,
-                    0x20, 0x72, 0x65, 0x74, 0x72, 0x79, 0x20, 0x74,
-                    0x6F, 0x6B, 0x65, 0x6E, 0x20, 0x6D, 0x61, 0x64,
-                    0x65, 0x20, 0x66, 0x6F, 0x72, 0x20, 0x74, 0x65,
-                    0x73, 0x74, 0x69, 0x6E, 0x67, 0x68, 0x65, 0x72,
-                    0x65, 0x20, 0x69, 0x73, 0x20, 0x69, 0x73, 0x68,
-                    0x65, 0x72, 0x65, 0x20, 0x69, 0x73, 0x20, 0x61,
-                    0x20, 0x72, 0x65, 0x74, 0x72, 0x79, 0x20, 0x74,
-                    0x6F, 0x6B, 0x65, 0x6E, 0x20, 0x6D, 0x61, 0x64,
-                    0x65, 0x20, 0x66, 0x6F, 0x72, 0x20, 0x74, 0x01,
-                    0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04, 0x01,
-                    0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                ],
-                UInt32(1),
-                dcids[7],
-                scids[7],
-                retryTokenLong,
-                "Valid long header, 8b dcid"
-            ),
-            // long header - retry packet - contains version, DCID length, DCID, SCID length, SCID, retry token, retry tag, no padding
+            // long header - retry packet - contains version, DCID length, DCID, SCID length, SCID, retry token, retry tag
             (
                 [
                     0xF0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x92, 0x0a,

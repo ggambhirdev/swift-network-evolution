@@ -142,6 +142,26 @@ enum QUICFrame: ~Copyable {
         }
     }
 
+    // Some inbound QUIC frame kinds (CRYPTO, STREAM, DATAGRAM) hold an
+    // embedded `Frame` that borrows into the packet's buffer, and MUST be
+    // finalized exactly once before being released - see `Frame.deinit`.
+    // Callers that reject a `QUICFrame` before handing it to `processFrame`
+    // (e.g. because it's invalid in an INITIAL packet, or not allowed during
+    // the handshake) must use this instead of just letting the value go out
+    // of scope, otherwise the unfinalized `Frame` trips a fatal precondition.
+    static func discard(_ frame: consuming QUICFrame, success: Bool = false) {
+        switch consume frame {
+        case .crypto(var frame):
+            frame.frame.finalize(success: success)
+        case .stream(var frame):
+            frame.frame.finalize(success: success)
+        case .datagram(var frame):
+            frame.frame.finalize(success: success)
+        default:
+            break
+        }
+    }
+
     static func parse(
         type: FrameType,
         frame: inout Frame,
@@ -1111,7 +1131,7 @@ struct FrameResetStream: ~Copyable, QUICFrameProtocol {
             // that case there is no one to deliver the reset to, so drop it.
             guard let existing = connection.flow(for: flowID) else {
                 Logger.proto.error(
-                    "stream \(streamID.value) has known flow but no QUICStreamInstance; dropping RESET_STREAM"
+                    "Stream \(streamID.value) has known flow but no QUICStreamInstance; dropping RESET_STREAM"
                 )
                 return true
             }
@@ -2466,7 +2486,7 @@ struct FrameNewConnectionID: QUICFrameProtocol {
         else {
             throw QUICError.frameParse(
                 FrameParseError.invalidValue(
-                    "cid length \(cidLength) not within 1...\(QUICConnectionID.maximumSize)"
+                    "CID length \(cidLength) not within 1...\(QUICConnectionID.maximumSize)"
                 )
             )
         }
@@ -2777,7 +2797,7 @@ struct FrameConnectionClose: ~Copyable, QUICFrameProtocol {
 
         guard let frameType = FrameType(rawValue: rawFrameType) else {
             throw QUICError.frameParse(
-                FrameParseError.invalidValue("invalid frame type: \(rawFrameType)")
+                FrameParseError.invalidValue("Invalid frame type: \(rawFrameType)")
             )
         }
         self.frameType = frameType

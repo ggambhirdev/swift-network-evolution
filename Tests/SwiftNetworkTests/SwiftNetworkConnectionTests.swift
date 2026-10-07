@@ -738,6 +738,10 @@ final class SwiftNetworkConnectionTests: NetTestCase {
 
     #if HAS_SWIFTTLS_RECORD
     func testTLSNoTransportDataPath() {
+        let serverSigningKey = P256.Signing.PrivateKey()
+        let serverPrivateKey = [UInt8](serverSigningKey.rawRepresentation)
+        let serverPublicKeys = [[UInt8](serverSigningKey.publicKey.derRepresentation)]
+
         let group = DispatchGroup()
         group.enter()
         let c1 = NetworkConnection(
@@ -748,6 +752,8 @@ final class SwiftNetworkConnectionTests: NetTestCase {
                         StreamBridge()
                     }
                 }
+                .trustedRawPublicKeyCertificates(serverPublicKeys)
+                .applicationProtocols(["network_test"])
             }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7777))
         )
         .onStateUpdate { _, state in
@@ -770,7 +776,10 @@ final class SwiftNetworkConnectionTests: NetTestCase {
                         StreamBridge()
                     }
                 }
+                .rawPrivateKey(serverPrivateKey)
+                .applicationProtocols(["network_test"])
             }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7778))
+                .serverMode(true)
         )
         .onStateUpdate { _, state in
             print("c2 \(state)")
@@ -783,8 +792,11 @@ final class SwiftNetworkConnectionTests: NetTestCase {
         }
         XCTAssertNotNil(c2)
 
-        c1.start()
+        // `StreamBridge` resolves its peer through a static port registry populated in
+        // `setup()` and drops anything addressed to an unregistered port. The TLS client
+        // transmits its ClientHello during `start()`, so the server must be started first.
         c2.start()
+        c1.start()
 
         c1.send(.message(content: [1, 2, 3])) { result in
             switch result {
@@ -887,4 +899,119 @@ final class SwiftNetworkConnectionTests: NetTestCase {
 
         c1.cancel()
     }
+
+    #if HAS_SWIFTTLS_RECORD
+    // Regression coverage for TLS stacked above CustomLink. `testNoTransportCustomLink`
+    // exercises a bare `NoTransport { CustomLink() }`, which resolves its options through a
+    // different branch, so it passed even while this arrangement was wired incorrectly.
+    func testTLSOverCustomLink() {
+        // Each side's outbound ciphertext is handed to the other side's rx injector, so the
+        // two handshakes drive each other without a socket.
+        final class Transfer: @unchecked Sendable {
+            var injectIntoClient: ((Span<UInt8>) -> Void)?
+            var injectIntoServer: ((Span<UInt8>) -> Void)?
+        }
+        let transfer = Transfer()
+
+        let serverSigningKey = P256.Signing.PrivateKey()
+        let serverPrivateKey = [UInt8](serverSigningKey.rawRepresentation)
+        let serverPublicKeys = [[UInt8](serverSigningKey.publicKey.derRepresentation)]
+
+        let handshaken = DispatchGroup()
+        handshaken.enter()
+        handshaken.enter()
+
+        let client = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 7778),
+            using: .parameters {
+                TLS {
+                    NoTransport {
+                        CustomLink()
+                            .tx { span in
+                                let bytes = Array(copying: span, maxCount: span.count)
+                                NetworkContext.implicitContext.async {
+                                    transfer.injectIntoServer?(bytes.span)
+                                }
+                            }
+                            .rx { handler in transfer.injectIntoClient = handler }
+                    }
+                }
+                .trustedRawPublicKeyCertificates(serverPublicKeys)
+                // SwiftTLS requires ALPN on the client; without it the client state machine
+                // fails to build and the connection fails with EINVAL before any bytes flow.
+                .applicationProtocols(["network_test"])
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7777))
+        )
+        .onStateUpdate { _, state in
+            print("client \(state)")
+            if case .ready = state { handshaken.leave() }
+        }
+
+        let server = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 7777),
+            using: .parameters {
+                TLS {
+                    NoTransport {
+                        CustomLink()
+                            .tx { span in
+                                let bytes = Array(copying: span, maxCount: span.count)
+                                NetworkContext.implicitContext.async {
+                                    transfer.injectIntoClient?(bytes.span)
+                                }
+                            }
+                            .rx { handler in transfer.injectIntoServer = handler }
+                    }
+                }
+                .rawPrivateKey(serverPrivateKey)
+                .applicationProtocols(["network_test"])
+                // `clientAuthRequired` has no dedicated modifier; it is reachable only
+                // through the `customOptions` escape hatch.
+                .customOptions { options in
+                    options.perProtocolOptions?.clientAuthRequired = false
+                }
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7778))
+                .serverMode(true)
+        )
+        .onStateUpdate { _, state in
+            print("server \(state)")
+            if case .ready = state { handshaken.leave() }
+        }
+
+        client.start()
+        server.start()
+
+        XCTAssertEqual(
+            handshaken.wait(timeout: DispatchTime.now() + .seconds(10)),
+            DispatchTimeoutResult.success,
+            "TLS over CustomLink never reached .ready; CustomLink most likely dropped the handshake bytes"
+        )
+
+        let received = DispatchGroup()
+        received.enter()
+
+        client.send(.message(content: [1, 2, 3])) { result in
+            if case .failure(let error) = result {
+                XCTFail("send failed with error \(error)")
+            }
+        }
+
+        server.receive(atLeast: 1, atMost: Int.max) { result in
+            switch result {
+            case .success(let message):
+                XCTAssertEqual(message.content, [1, 2, 3])
+                received.leave()
+            case .failure(let error):
+                XCTFail("receive failed with error \(error)")
+            }
+        }
+
+        XCTAssertEqual(
+            received.wait(timeout: DispatchTime.now() + .seconds(10)),
+            DispatchTimeoutResult.success
+        )
+
+        client.cancel()
+        server.cancel()
+    }
+    #endif
 }
